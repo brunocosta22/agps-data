@@ -26,6 +26,10 @@ jobs:
               --no-ini \
               --output docs/archive/agps_${TS}.ubx
 
+      - name: Cleanup old files
+        run: |
+          find docs/archive -type f -name "*.ubx" -mtime +2 -delete
+    
       - name: Update latest
         run: |
           cp docs/archive/agps_${TS}.ubx docs/latest.ubx
