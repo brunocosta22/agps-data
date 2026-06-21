@@ -45,7 +45,7 @@ jobs:
       - name: Commit changes
         run: |
           git config user.name "agps-bot"
-          git config user.email "agps-bot@users.noreply.github.com"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add docs/
 
