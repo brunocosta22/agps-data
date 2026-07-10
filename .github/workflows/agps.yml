@@ -19,12 +19,20 @@ jobs:
         run: |
           echo "TS=$(date -u +%Y%m%d_%H%M)" >> $GITHUB_ENV
 
-      - name: Download A-GPS
+      - name: Download A-GPS (live RINEX ephemeris + AssistNow merge)
+        env:
+          # Thingstream ZTP device-profile token (a UUID). Set as a repo secret:
+          # Settings -> Secrets and variables -> Actions. Without it the script
+          # silently falls back to live-only (RINEX) output.
+          ASSISTNOW_TOKEN: ${{ secrets.ASSISTNOW_TOKEN }}
         run: |
           mkdir -p docs/archive
           python3 agps_download.py \
               --no-ini \
-              --output docs/archive/agps_${TS}.ubx
+              --output docs/archive/agps_${TS}.ubx \
+              --assistnow-data predictive \
+              --assistnow-cache docs/agps_assistnow_cache.ubx \
+              --assistnow-max-age-h 12
 
       - name: Cleanup old files
         run: |

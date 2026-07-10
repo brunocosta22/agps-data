@@ -41,10 +41,12 @@ import argparse
 import gzip
 import json
 import math
+import os
 import struct
 import sys
 import urllib.request
 import urllib.error
+import urllib.parse
 from datetime import datetime, timezone, timedelta
 
 PI = math.pi
@@ -612,6 +614,156 @@ def inject_serial(binary: bytes, port: str, baud: int, chunk: int,
     ser.close()
 
 
+# ── AssistNow via Thingstream ZTP (live + predicted orbits, UBX-MGA) ─────
+# Modern u-blox AssistNow is authenticated with a Thingstream Zero-Touch-
+# Provisioning (ZTP) device-profile token plus the receiver's identity (its
+# UBX-SEC-UNIQID and UBX-MON-VER responses). Two-step flow:
+#   1. POST {token, messages:{UBX-SEC-UNIQID, UBX-MON-VER}} to the ZTP endpoint
+#      -> {chipcode, serviceUrl, allowedData}
+#   2. GET  serviceUrl?chipcode=..&data=..&gnss=..  -> a ready UBX-MGA stream
+# The stream (live MGA-* ephemeris and/or predicted MGA-ANO, plus almanac,
+# ionosphere and time) merges into the same blob as the live RINEX ephemeris
+# with no firmware change -- the device's inject loop is frame-type-agnostic.
+#
+# NOTE: the legacy token-based GetOfflineData.ashx is deliberately NOT used. A
+# ZTP UUID token is a different credential and that service rejects it (HTTP 400
+# "Invalid token"), which is why the previous path silently produced live-only
+# output.
+
+ZTP_CREDENTIALS_URL = "https://api.thingstream.io/ztp/assistnow/credentials"
+
+# Identity of the target u-blox module (MAX-M10S, SPG 5.10). These are NOT
+# secret -- they only authorize the ZTP request. Override with --uniqid /
+# --monver (or the UBX_SEC_UNIQID / UBX_MON_VER env vars) for another module.
+# The AssistNow data returned is generic GNSS aiding usable by any receiver, so
+# a headless CI job with no module attached still fetches a publishable blob.
+DEFAULT_UNIQID = "b56227030a0002000000ffcef10f33548a80"
+DEFAULT_MONVER = (
+    "b5620a04be00524f4d2053504720352e3130202837623230326529000000000000000000"
+    "3030304130303030000046575645523d53504720352e3130000000000000000000000000"
+    "0000000050524f545645523d33342e313000000000000000000000000000000000004d4f"
+    "443d4d41582d4d3130530000000000000000000000000000000000004750533b474c4f3b"
+    "47414c3b424453000000000000000000000000000000534241533b515a53530000000000"
+    "0000000000000000000000000000000046ba"
+)
+
+# --assistnow-data preset -> the service 'data=' string. 'both' rides live
+# ephemeris and multi-day predicted orbits in a single request (same quota).
+ASSISTNOW_DATA = {
+    "predictive": "uporb_1,ualm",
+    "live":       "ulorb_l1,ukion,usvht,ualm",
+    "both":       "uporb_1,ulorb_l1,ukion,usvht,ualm",
+}
+
+# Default cache lifetime per mode: predicted orbits stay valid for days, live
+# orbits expire within a few hours, so live/both refresh far more often.
+ASSISTNOW_DEFAULT_MAX_AGE_H = {"predictive": 12.0, "live": 1.0, "both": 1.0}
+
+
+def fetch_ztp_credentials(token, uniqid_hex, monver_hex):
+    """POST the ZTP token + receiver identity; return (chipcode, service_url,
+    allowed_data). Raises on any transport/format error."""
+    body = json.dumps({
+        "token": token,
+        "messages": {"UBX-SEC-UNIQID": uniqid_hex, "UBX-MON-VER": monver_hex},
+    }).encode()
+    req = urllib.request.Request(
+        ZTP_CREDENTIALS_URL, data=body,
+        headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=30) as r:
+        creds = json.loads(r.read().decode())
+    if "chipcode" not in creds or "serviceUrl" not in creds:
+        raise RuntimeError(f"ZTP response missing chipcode/serviceUrl: {creds}")
+    return creds["chipcode"], creds["serviceUrl"], creds.get("allowedData", "")
+
+
+def fetch_assistnow_mga(token, uniqid_hex, monver_hex, data_str, gnss):
+    """Full ZTP AssistNow fetch (credentials -> data). Returns the raw UBX-MGA
+    bytes or raises RuntimeError. Consumes service quota -- call only via
+    get_assistnow_blob() so the cache gates it."""
+    try:
+        chipcode, service_url, allowed = fetch_ztp_credentials(
+            token, uniqid_hex, monver_hex)
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"ZTP credentials failed ({exc.code}): "
+                           f"{exc.read().decode()[:200]}")
+    except (urllib.error.URLError, ValueError, RuntimeError) as exc:
+        raise RuntimeError(f"ZTP credentials failed: {exc}")
+    print(f"AssistNow ZTP: chipcode obtained (allowedData: {allowed})", file=sys.stderr)
+
+    query = urllib.parse.urlencode(
+        {"chipcode": chipcode, "data": data_str, "gnss": gnss})
+    print(f"AssistNow: GET {service_url} (data={data_str} gnss={gnss})", file=sys.stderr)
+    try:
+        with urllib.request.urlopen(f"{service_url}?{query}", timeout=60) as r:
+            data = r.read()
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"AssistNow data failed ({exc.code}): "
+                           f"{exc.read().decode()[:200]}")
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"AssistNow data failed: {exc}")
+    if len(data) < 8 or data[0] != 0xB5 or data[1] != 0x62:
+        raise RuntimeError(
+            f"AssistNow response is not UBX ({len(data)} bytes): {data[:80]!r}")
+    print(f"  OK -- {len(data)} bytes of UBX-MGA", file=sys.stderr)
+    return data
+
+
+def get_assistnow_blob(token, uniqid_hex, monver_hex, data_str, gnss,
+                       cache_path, max_age_h):
+    """Return the AssistNow MGA blob, reusing a cached copy while it is younger
+    than max_age_h so the service quota is respected even when this script runs
+    hourly. Persist cache_path (+ '.json') between runs (a committed file or
+    actions/cache). Returns bytes, or b'' if unavailable (never fatal)."""
+    meta_path = cache_path + ".json"
+
+    # Reuse a fresh cache without spending a request.
+    try:
+        with open(meta_path) as f:
+            meta = json.load(f)
+        age_h = (datetime.now(timezone.utc)
+                 - datetime.fromisoformat(meta["fetched_utc"])).total_seconds() / 3600.0
+        params_match = (meta.get("data") == data_str and meta.get("gnss") == gnss)
+        if params_match and age_h < max_age_h:
+            with open(cache_path, "rb") as f:
+                data = f.read()
+            print(f"AssistNow: cache hit ({age_h:.1f} h old, {len(data)} bytes) "
+                  "-- not calling the service", file=sys.stderr)
+            return data
+        print(f"AssistNow: cache stale ({age_h:.1f} h >= {max_age_h} h) or params "
+              "changed -- refreshing", file=sys.stderr)
+    except (FileNotFoundError, KeyError, ValueError) as exc:
+        print(f"AssistNow: no usable cache ({exc}) -- fetching", file=sys.stderr)
+
+    # Cache miss / stale: spend one quota request.
+    try:
+        data = fetch_assistnow_mga(token, uniqid_hex, monver_hex, data_str, gnss)
+    except RuntimeError as exc:
+        # Fall back to a stale cache if present -- old aiding beats none, and the
+        # hourly live publish must never break on an AssistNow hiccup.
+        try:
+            with open(cache_path, "rb") as f:
+                data = f.read()
+            print(f"AssistNow: fetch failed, reusing stale cache "
+                  f"({len(data)} bytes): {exc}", file=sys.stderr)
+            return data
+        except FileNotFoundError:
+            print(f"AssistNow: fetch failed and no cache -- live-only this run: "
+                  f"{exc}", file=sys.stderr)
+            return b""
+
+    with open(cache_path, "wb") as f:
+        f.write(data)
+    with open(meta_path, "w") as f:
+        json.dump({
+            "fetched_utc": datetime.now(timezone.utc).isoformat(),
+            "data": data_str,
+            "gnss": gnss,
+            "bytes": len(data),
+        }, f)
+    return data
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -654,6 +806,35 @@ def main():
                          "INI-TIME/INI-POS frames. The device generates time/position itself "
                          "on apply, so a re-applied blob is never stale. Use this for the "
                          "hourly file published at a stable URL.")
+    # ── AssistNow via ZTP (live + predicted orbits) merge ────────────────
+    ap.add_argument("--assistnow-token", default=os.environ.get("ASSISTNOW_TOKEN"),
+                    help="Thingstream ZTP device-profile token (a UUID), or the "
+                         "ASSISTNOW_TOKEN env var. When set, an AssistNow UBX-MGA stream "
+                         "(live ephemeris and/or predicted orbits) is merged into the "
+                         "output. Keep it SECRET: pass via env / CI secret, never commit it.")
+    ap.add_argument("--assistnow-data", choices=["predictive", "live", "both"],
+                    default="both",
+                    help="Which aiding to fetch: 'predictive' (multi-day MGA-ANO orbits), "
+                         "'live' (current ephemeris, best TTFF, expires in hours), or "
+                         "'both' (default; one request).")
+    ap.add_argument("--assistnow-gnss", default="gps,gal,glo,bds,qzss",
+                    help="Constellations for AssistNow, comma-separated "
+                         "(default: gps,gal,glo,bds,qzss).")
+    ap.add_argument("--uniqid", default=os.environ.get("UBX_SEC_UNIQID", DEFAULT_UNIQID),
+                    help="Target module UBX-SEC-UNIQID response as hex (full UBX frame). "
+                         "Defaults to the built-in MAX-M10S; authorizes the ZTP request "
+                         "only (not secret).")
+    ap.add_argument("--monver", default=os.environ.get("UBX_MON_VER", DEFAULT_MONVER),
+                    help="Target module UBX-MON-VER response as hex (full UBX frame). "
+                         "Defaults to the built-in MAX-M10S.")
+    ap.add_argument("--assistnow-cache", default="agps_assistnow_cache.ubx",
+                    help="Where to persist the AssistNow blob between runs (default: "
+                         "agps_assistnow_cache.ubx). Persist this file AND its '.json' "
+                         "sidecar across CI runs so the service quota is respected.")
+    ap.add_argument("--assistnow-max-age-h", type=float, default=None,
+                    help="Only re-fetch when the cache is older than this. Default depends "
+                         "on --assistnow-data: 12 h for 'predictive', 1 h for 'live'/'both' "
+                         "(live orbits expire fast).")
     args = ap.parse_args()
 
     now = datetime.now(timezone.utc)
@@ -733,6 +914,26 @@ def main():
         print_stats(frames, fresh)
 
     binary = b"".join(frames)
+
+    # ── Merge AssistNow aiding (ZTP) after the live RINEX ephemeris ─────────
+    # The device injects any UBX-MGA frames in the blob, so the AssistNow stream
+    # (live ephemeris and/or predicted MGA-ANO) rides along with no firmware
+    # change. Cache-gated so the service quota is respected even when run hourly.
+    if args.assistnow_token:
+        data_str = ASSISTNOW_DATA[args.assistnow_data]
+        max_age_h = (args.assistnow_max_age_h if args.assistnow_max_age_h is not None
+                     else ASSISTNOW_DEFAULT_MAX_AGE_H[args.assistnow_data])
+        aiding = get_assistnow_blob(
+            args.assistnow_token, args.uniqid, args.monver, data_str,
+            args.assistnow_gnss, args.assistnow_cache, max_age_h)
+        if aiding:
+            binary += aiding
+            print(f"Merged {len(aiding)} bytes of AssistNow aiding "
+                  f"({args.assistnow_data}); blob now {len(binary)} bytes",
+                  file=sys.stderr)
+    else:
+        print("No AssistNow token (--assistnow-token / ASSISTNOW_TOKEN) -- live-only "
+              "output", file=sys.stderr)
 
     # ── Output / injection ────────────────────────────────────────────────────
     if args.port:
