@@ -2,36 +2,55 @@
 """
 Free AGPS data generator for u-blox M10.
 
-Downloads today's RINEX 3 mixed broadcast navigation file from BKG/IGS
-(no registration, no token required) and converts GPS ephemeris + current
-time to UBX-MGA binary format for use with ubx_m10_send_agps().
+Two independent sources of aiding, deliberately published as two files:
+
+  * live RINEX ephemeris (--output): today's broadcast navigation data from
+    BKG/IGS hourly stations, no registration and no token, converted to
+    UBX-MGA-GPS-EPH. GPS only.
+  * AssistNow (--assistnow-output): the u-blox service reached through a
+    Thingstream ZTP token, carrying almanac, ionosphere, predicted orbits
+    (MGA-ANO) and -- with --assistnow-data live/both -- live ephemeris for
+    every constellation.
+
+They are kept apart on purpose. The AssistNow blob is served from a cache and
+carries its own timestamps and expiry dates, the RINEX blob is built now; merged
+into one file a receiver cannot tell which half is which, and a stale INI-TIME
+from the cached half told it the wrong hour entirely. Everything written out is
+walked frame by frame first (see sanitize_mga_stream / describe_ubx): expired
+predicted orbits, cached INI-TIME, live ephemeris past its fit interval and
+almanac records with impossible orbits are dropped, and a structurally broken
+blob is not written at all so the previous good file keeps being served.
 
 Sources (tried in order, all free):
-  - BKG (Germany):  https://igs.bkg.bund.de/root_ftp/IGS/BRDC/...
-  - EUREF (BKG):    https://igs.bkg.bund.de/root_ftp/EUREF/BRDC/...
+  - BKG hourly NRT:  https://igs.bkg.bund.de/root_ftp/IGS/nrt/{doy}/{hh}/
+  - BKG daily BRDC:  https://igs.bkg.bund.de/root_ftp/IGS/BRDC/...
 
 Usage:
-    # Write a raw .ubx file
+    # Write a raw .ubx file (live RINEX ephemeris only)
     python3 agps_download.py [--output agps.ubx] [--date YYYY-MM-DD]
                              [--max-age-h 4] [--stats]
 
-    # Online hot start — stream straight to the board and trigger the fix.
+    # Server mode: the two files published at a stable URL (see
+    # .github/workflows/agps.yml for the full hourly invocation)
+    python3 agps_download.py --no-ini --assistnow-data both
+        --output docs/latest_rinex.ubx --assistnow-output docs/latest.ubx
+
+    # Check a file someone else produced (frame inventory + field alignment)
+    python3 agps_download.py --verify docs/latest.ubx
+
+    # Online hot start -- stream straight to the board and trigger the fix.
     # Position is seeded automatically (IP geolocation, Portugal fallback);
     # use --pos=pt to force Portugal offline, or --pos=lat,lon to set it.
     python3 agps_download.py --port /dev/ttyACM0
 
-    # Online hot start — print shell lines to paste into the board terminal
+    # Online hot start -- print shell lines to paste into the board terminal
     python3 agps_download.py --format shell
 
 Ephemeris source (--source): 'hourly' (default via auto) pulls per-station hourly
-broadcast nav (age < 1 h → true hot start); falls back to the daily file.
+broadcast nav (age < 1 h -> true hot start), taking stations one region at a time
+until --min-prns satellites have fresh ephemeris; falls back to the daily file.
 
-The data contains:
-  - UBX-MGA-INI-TIME-UTC  (current time injection)
-  - UBX-MGA-INI-POS-LLH   (optional, with --pos)
-  - UBX-MGA-GPS-EPH       (one frame per fresh GPS satellite)
-
-On the board the GNSS test consumes it via the shell:
+On the board the GNSS test consumes either file via the shell:
     test gnss agps init          # power/init the M10
     test gnss agps <hexbytes>    # one UBX-MGA chunk per line (repeated)
     test gnss agps fix [timeout] # wait for the hot-start fix, print the TTFF
@@ -42,6 +61,7 @@ import gzip
 import json
 import math
 import os
+import re
 import struct
 import sys
 import urllib.request
@@ -159,6 +179,39 @@ def _clamp(v, lo, hi):
 
 # ── GPS ephemeris → UBX-MGA-GPS-EPH (68-byte payload) ───────────────────────
 
+def _check_gps_eph_layout(payload: bytes) -> None:
+    """Raise ValueError if a UBX-MGA-GPS-EPH payload is not laid out correctly.
+
+    Every field offset depends on the two-byte type/version header being there,
+    and the UBX checksum is computed over whatever was packed, so a shifted
+    payload is accepted by the file format and rejected by the receiver. Reading
+    e and sqrtA back at their spec offsets catches that: any misalignment turns
+    them into nonsense, while a correct frame always lands in the GPS family
+    (sqrtA ~ 5153.6 m^1/2, a ~ 26 560 km).
+    """
+    if len(payload) != 68:
+        raise ValueError("payload is %d bytes, expected 68" % len(payload))
+    if payload[0] != 0x01 or payload[1] != 0x00:
+        raise ValueError("type/version = %02X/%02X, expected 01/00"
+                         % (payload[0], payload[1]))
+    if not 1 <= payload[2] <= 32:
+        raise ValueError("svId = %d out of range 1..32" % payload[2])
+    e = struct.unpack_from("<I", payload, 32)[0] * 2.0 ** -33
+    sqrt_a = struct.unpack_from("<I", payload, 36)[0] * 2.0 ** -19
+    if not 0.0 <= e < 0.05:
+        raise ValueError("e = %.6f implausible -- fields misaligned?" % e)
+    if not 5100.0 <= sqrt_a <= 5200.0:
+        raise ValueError("sqrtA = %.1f m^1/2 implausible -- fields misaligned?"
+                         % sqrt_a)
+    # Every GPS satellite shares essentially the same orbit, so the nodal rate
+    # is always close to -2.6e-9 semicircles/s. At the ICD's 2^-43 LSB that is
+    # about -22 700; a wrong scale factor or offset lands nowhere near it.
+    om_dot = struct.unpack_from("<i", payload, 60)[0]
+    if not -40000 <= om_dot <= -5000:
+        raise ValueError("omegaDot = %d LSB implausible -- wrong scale factor?"
+                         % om_dot)
+
+
 def gps_ephem_to_ubx(rec: dict) -> bytes:
     """
     Convert a parsed RINEX 3 GPS nav record to UBX-MGA-GPS-EPH.
@@ -187,8 +240,11 @@ def gps_ephem_to_ubx(rec: dict) -> bytes:
     af2  = _clamp(rec["af2"] / 2**-55,    -128, 127)
     tgd  = _clamp(rec["TGD"] / 2**-31,    -128, 127)
     iodc = rec["IODC"] & 0x3FF
-    toc  = int(rec["toc_sow"] / 16) & 0xFFFF
-    toe  = int(rec["toe_sow"] / 16) & 0xFFFF
+    # toc/toe have a 16 s LSB. Round, do not truncate: toc and toe are the
+    # same instant for GPS, and truncating a value a hair above the multiple
+    # pushed toc one LSB past toe on every single frame.
+    toc  = int(round(rec["toc_sow"] / 16)) & 0xFFFF
+    toe  = int(round(rec["toe_sow"] / 16)) & 0xFFFF
 
     # Orbit params
     crs    = _clamp(rec["Crs"]  / 2**-5,  -(2**15), 2**15 - 1)
@@ -205,13 +261,21 @@ def gps_ephem_to_ubx(rec: dict) -> bytes:
     omega0  = rad_to_semi_i4(rec["Omega0"])
     i0      = rad_to_semi_i4(rec["i0"])
     omega   = rad_to_semi_i4(rec["omega"])
-    omDot   = rad_to_semi_i4(rec["Omega_dot"])   # I4 in UBX (not I2!)
+    # omegaDot is I4 with the ICD's 2^-43 LSB, not 2^-31: the field is 4 bytes
+    # wide precisely because the ICD gives it 24 bits at 2^-43. Scaling it like
+    # the 2^-31 angles collapsed every satellite's nodal rate to about six LSB.
+    omDot   = _clamp(rec["Omega_dot"] / PI / 2**-43, -(2**31), 2**31 - 1)
     idot    = rad_to_semi_i2(rec["IDOT"])
 
-    # UBX-MGA-GPS-EPH payload: 68 bytes
-    # Format verified: struct.calcsize("<BBBBBbHHBbhihhihhIIHhihhiiihI") == 68
+    # UBX-MGA-GPS-EPH payload: 68 bytes, starting with the two-byte
+    # type/version header every UBX-MGA message carries. Without it the whole
+    # payload is shifted by two bytes: the receiver reads svId as the message
+    # type and discards the frame (visible as a NAK in UBX-MGA-ACK).
+    # struct.calcsize("<BBBBBBBbHHBbhihhihhIIHhihhiiihH") == 68
     payload = struct.pack(
-        "<BBBBBbHHBbhihhihhIIHhihhiiihI",
+        "<BBBBBBBbHHBbhihhihhIIHhihhiiihH",
+        0x01,    # U1  type = EPH
+        0x00,    # U1  version
         prn,     # U1  svId
         0,       # U1  reserved1
         fit,     # U1  fitInterval
@@ -240,9 +304,9 @@ def gps_ephem_to_ubx(rec: dict) -> bytes:
         omega,   # I4  omega
         omDot,   # I4  omegaDot
         idot,    # I2  idot
-        0,       # U4  reserved3
+        0,       # U2  reserved3
     )
-    assert len(payload) == 68, f"GPS EPH payload size: {len(payload)}"
+    _check_gps_eph_layout(payload)
     return make_ubx_frame(UBX_CLASS_MGA, MGA_GPS, payload)
 
 
@@ -275,43 +339,124 @@ def download_rinex(date: datetime) -> str:
 
 # ── Hourly RINEX 3 BRDC (fresh ephemeris for a true hot start) ──────────────
 # BKG near-real-time tree: /IGS/nrt/{doy}/{hh}/{STATION}_R_{yyyy}{doy}{hh}00_01H_MN.rnx.gz
-# Each file is one station's broadcast nav for that hour (toe within ~1 h). A
-# few stations are merged for full GPS coverage; Iberian/European ones first so
-# the satellites visible from Portugal are covered with the freshest ephemeris.
+# Each file is one station's broadcast nav for that hour (toe within ~1 h);
+# several are merged, chosen for geographic spread (see HOURLY_REGION_ORDER).
 _BKG_NRT = _BKG + "/IGS/nrt"
-HOURLY_STATIONS = [
-    "EBRE00ESP", "CEBR00ESP", "CACE00ESP", "CANT00ESP", "ALAC00ESP",  # Iberia
-    "BRUX00BEL", "BRST00FRA", "GANP00SVK", "BUCU00ROU",               # Europe
-    "AREG00PER", "GAMG00KOR", "FAA100PYF", "ABMF00GLP",               # global
+_HOURLY_RE = r'([A-Z0-9]{9})_R_\d+_01H_MN\.rnx\.gz'
+
+# An hourly file only holds what that station tracked during that hour, so
+# geographic spread — not proximity — is what covers the constellation:
+# broadcast ephemeris is identical wherever it is received, and satellites out
+# of view from Iberia are only fresh in a station that can see them. Stations
+# are therefore taken one region at a time, in this order, so the first few
+# downloads already look at different parts of the sky. Whatever is not listed
+# here comes after, alphabetically.
+HOURLY_REGION_ORDER = [
+    "PRT", "ESP", "AUS", "PER", "KOR", "ZAF", "PYF", "GRL", "ARG", "PHL",
+    "IND", "CAN", "KEN", "REU", "GUF", "NCL", "SYC", "UZB", "DJI", "BES",
+    "MTQ", "SPM", "ISL", "FIN", "SWE", "GRC", "TUR", "CYP", "UKR",
+]
+# Used only when the directory index cannot be read.
+HOURLY_STATIONS_FALLBACK = [
+    "RAEG00PRT", "ALAC00ESP", "NNOR00AUS", "AREG00PER", "GAMG00KOR",
+    "HARB00ZAF", "FAA100PYF", "THU200GRL", "MGUE00ARG", "PTGG00PHL",
+    "GDKG00IND", "YEL200CAN", "MAL200KEN", "REUN00REU", "KOUR00GUF",
+    "CEBR00ESP", "CACE00ESP", "NKLG00GAB", "REYK00ISL", "BRUX00BEL",
 ]
 
 
-def download_rinex_hourly(now: datetime, max_back: int = 4,
-                          min_stations: int = 4) -> tuple:
-    """Download the latest available hourly broadcast nav from a few stations.
-    Returns (concatenated_text, reference_datetime) or (None, None)."""
+def _list_hourly_stations(doy: int, hh: int):
+    """Stations with an hourly mixed-nav file in the BKG NRT tree for that hour.
+
+    Reading the index first turns a list of guesses into the list that actually
+    exists, so no round-trip is spent on a 404. Returns the station list, [] if
+    the hour is not published yet (so the caller moves straight to the previous
+    hour instead of probing a dozen missing files), or None if the index itself
+    could not be read and the built-in list should be used.
+    """
+    url = f"{_BKG_NRT}/{doy:03d}/{hh:02d}/"
+    try:
+        with urllib.request.urlopen(url, timeout=20) as r:
+            html = r.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        return [] if exc.code == 404 else None
+    except urllib.error.URLError:
+        return None
+    return sorted(set(re.findall(_HOURLY_RE, html)))
+
+
+def _order_stations_for_spread(stations: list) -> list:
+    """Round-robin the stations across regions, preferred regions first."""
+    by_region = {}
+    for st in stations:
+        by_region.setdefault(st[-3:], []).append(st)
+    ranked = sorted(by_region, key=lambda c: (
+        HOURLY_REGION_ORDER.index(c) if c in HOURLY_REGION_ORDER else 99, c))
+    out = []
+    while any(by_region.values()):
+        for code in ranked:
+            if by_region[code]:
+                out.append(by_region[code].pop(0))
+    return out
+
+
+def _record_age_h(rec: dict, now_sow: float) -> float:
+    """Absolute age of a nav record in hours, the short way round the week."""
+    d = (now_sow - rec["toc_sow"]) % 604800
+    if d > 302400:
+        d -= 604800
+    return abs(d) / 3600.0
+
+
+def download_rinex_hourly(now: datetime, max_age_h: float = 4.0,
+                          min_prns: int = 30, max_back: int = 4,
+                          max_stations: int = 12) -> tuple:
+    """Download hourly broadcast nav until min_prns GPS PRNs have an ephemeris
+    younger than max_age_h. Returns (records, reference_datetime) or (None, None).
+
+    The stop criterion counts *fresh* PRNs, not PRNs present: every station also
+    holds the last ephemeris it heard from satellites long out of view, so
+    counting records made three Iberian stations look like full coverage while
+    a third of the constellation was ten hours stale and dropped later.
+    """
+    _, now_sow = _week_sow(now)
     for back in range(max_back):
         t = now - timedelta(hours=back)
         year, doy, hh = t.year, _doy(t), t.hour
-        texts = []
-        for st in HOURLY_STATIONS:
+        stations = _list_hourly_stations(doy, hh)
+        if stations == []:
+            print(f"  hourly {doy:03d}/{hh:02d}h not published yet — trying the "
+                  "previous hour", file=sys.stderr)
+            continue
+        if stations is None:
+            print(f"  hourly {doy:03d}/{hh:02d}h: no directory index, using the "
+                  "built-in station list", file=sys.stderr)
+            stations = HOURLY_STATIONS_FALLBACK
+        order = _order_stations_for_spread(stations)[:max_stations]
+        records, fresh_prns = [], set()
+        for st in order:
             url = (f"{_BKG_NRT}/{doy:03d}/{hh:02d}/"
                    f"{st}_R_{year:04d}{doy:03d}{hh:02d}00_01H_MN.rnx.gz")
             try:
                 with urllib.request.urlopen(url, timeout=20) as r:
                     raw = r.read()
-                if raw[:2] == b"\x1f\x8b":
-                    raw = gzip.decompress(raw)
-                texts.append(raw.decode("ascii", errors="replace"))
-                print(f"  hourly {st} {doy:03d}/{hh:02d}h OK", file=sys.stderr)
             except urllib.error.URLError:
                 continue
-            if len(texts) >= min_stations:
+            if raw[:2] == b"\x1f\x8b":
+                raw = gzip.decompress(raw)
+            recs = parse_gps_nav(raw.decode("ascii", errors="replace"))
+            records += recs
+            fresh_prns |= {r["prn"] for r in recs
+                           if _record_age_h(r, now_sow) <= max_age_h}
+            print(f"  hourly {st} {doy:03d}/{hh:02d}h OK — {len(fresh_prns)} PRNs "
+                  f"fresh (< {max_age_h} h)", file=sys.stderr)
+            if len(fresh_prns) >= min_prns:
                 break
-        if texts:
-            print(f"Hourly ephemeris: {len(texts)} station(s) @ {doy:03d}/{hh:02d}h UTC",
+        if records:
+            print(f"Hourly ephemeris @ {doy:03d}/{hh:02d}h UTC: {len(records)} "
+                  f"records, {len(fresh_prns)} PRNs fresher than {max_age_h} h",
                   file=sys.stderr)
-            return "\n".join(texts), t
+            return records, t
     return None, None
 
 
@@ -330,13 +475,17 @@ def _row(line: str):
 
 
 def _toc_to_sow(year, month, day, hour, minute, second) -> float:
-    """Convert RINEX toc epoch to GPS seconds-of-week."""
+    """Convert a RINEX 3 GPS nav epoch to GPS seconds-of-week.
+
+    RINEX 3 timestamps GPS navigation records in GPS time, not UTC, so no leap
+    second is added here. Adding one made toc land 18 s past toe, which the 16 s
+    LSB then rounded into a permanent one-LSB skew between the two.
+    """
     if year < 100:
         year += 2000
-    dt_utc = datetime(year, month, day, hour, minute, int(second),
-                      tzinfo=timezone.utc)
-    gps_sec = (dt_utc - GPS_EPOCH).total_seconds() + GPS_LEAP_SECONDS
-    return gps_sec % 604800
+    dt = datetime(year, month, day, hour, minute, int(second),
+                  tzinfo=timezone.utc)
+    return ((dt - GPS_EPOCH).total_seconds()) % 604800
 
 
 def parse_gps_nav(text: str) -> list:
@@ -425,33 +574,11 @@ def filter_fresh_now(records: list, now: datetime, max_age_h: float) -> list:
     best = {}
 
     for r in records:
-        d = (now_sow - r["toc_sow"]) % 604800
-        if d > 302400:          # take the shorter way round the week
-            d -= 604800
-        age_s = abs(d)
-        if age_s <= max_age_h * 3600:
+        age_h = _record_age_h(r, now_sow)
+        if age_h <= max_age_h:
             prn = r["prn"]
-            if prn not in best or age_s < best[prn][0]:
-                best[prn] = (age_s, r)
-
-    return [v for _, v in sorted(best.values(), key=lambda x: x[1]["prn"])]
-
-
-def filter_fresh(records: list, rinex_date: datetime, max_age_h: float) -> list:
-    """Keep the most recent record per PRN within max_age_h of the RINEX file date."""
-    _, ref_sow = _week_sow(rinex_date)
-    # End of the reference day in GPS SOW
-    end_sow = (ref_sow + 86400) % 604800
-    best = {}
-
-    for r in records:
-        toc = r["toc_sow"]
-        # Age = how many seconds before the end of the RINEX day
-        age_s = (end_sow - toc) % 604800
-        if age_s <= max_age_h * 3600:
-            prn = r["prn"]
-            if prn not in best or age_s < best[prn][0]:
-                best[prn] = (age_s, r)
+            if prn not in best or age_h < best[prn][0]:
+                best[prn] = (age_h, r)
 
     return [v for _, v in sorted(best.values(), key=lambda x: x[1]["prn"])]
 
@@ -459,17 +586,6 @@ def filter_fresh(records: list, rinex_date: datetime, max_age_h: float) -> list:
 def _week_sow(dt: datetime):
     gps_sec = (dt - GPS_EPOCH).total_seconds() + GPS_LEAP_SECONDS
     return int(gps_sec // 604800), gps_sec % 604800
-
-
-# ── Statistics ───────────────────────────────────────────────────────────────
-
-def print_stats(frames: list, fresh: list):
-    print(f"\nAGPS file summary:")
-    print(f"  Total UBX frames : {len(frames)}")
-    print(f"  GPS satellites   : {len(fresh)}")
-    if fresh:
-        prns = sorted(r["prn"] for r in fresh)
-        print(f"  PRNs included    : {prns}")
 
 
 # ── Approximate position resolver (for the hot-start seed) ──────────────────
@@ -649,11 +765,36 @@ DEFAULT_MONVER = (
 
 # --assistnow-data preset -> the service 'data=' string. 'both' rides live
 # ephemeris and multi-day predicted orbits in a single request (same quota).
-ASSISTNOW_DATA = {
-    "predictive": "uporb_1,ualm",
-    "live":       "ulorb_l1,ukion,usvht,ualm",
-    "both":       "uporb_1,ulorb_l1,ukion,usvht,ualm",
-}
+# 'uporb_N' asks for N days of predicted orbits: a single day expires at the
+# next UTC midnight, which is how a file published at 09:00 ended up carrying
+# nothing but yesterday's offline data.
+ASSISTNOW_PRESETS = ("predictive", "live", "both")
+
+
+def assistnow_data_str(preset: str, days: int = 3) -> str:
+    porb = f"uporb_{max(1, min(14, int(days)))}"
+    return {
+        "predictive": f"{porb},ualm",
+        "live":       "ulorb_l1,ukion,usvht,ualm",
+        "both":       f"{porb},ulorb_l1,ukion,usvht,ualm",
+    }[preset]
+
+
+def assistnow_data_attempts(preset: str, days: int) -> list:
+    """The 'data=' strings to try, most complete first.
+
+    A device profile is not necessarily entitled to multi-day predicted orbits,
+    and a rejected request must not cost the whole fetch, so the multi-day ask
+    degrades to a single day and then to live-only aiding.
+    """
+    out = [assistnow_data_str(preset, days)]
+    for fallback in (assistnow_data_str(preset, 1),
+                     assistnow_data_str("live", 1),
+                     assistnow_data_str("predictive", 1)):
+        if fallback not in out:
+            out.append(fallback)
+    return out
+
 
 # Default cache lifetime per mode: predicted orbits stay valid for days, live
 # orbits expire within a few hours, so live/both refresh far more often.
@@ -677,10 +818,14 @@ def fetch_ztp_credentials(token, uniqid_hex, monver_hex):
     return creds["chipcode"], creds["serviceUrl"], creds.get("allowedData", "")
 
 
-def fetch_assistnow_mga(token, uniqid_hex, monver_hex, data_str, gnss):
-    """Full ZTP AssistNow fetch (credentials -> data). Returns the raw UBX-MGA
-    bytes or raises RuntimeError. Consumes service quota -- call only via
-    get_assistnow_blob() so the cache gates it."""
+def fetch_assistnow_mga(token, uniqid_hex, monver_hex, data_strs, gnss):
+    """Full ZTP AssistNow fetch (credentials -> data). Returns (raw UBX-MGA
+    bytes, the 'data=' string that worked) or raises RuntimeError. Consumes
+    service quota -- call only via get_assistnow_blob() so the cache gates it.
+    The credentials are fetched once and reused across the data-string
+    fallbacks, so a downgraded request costs no extra quota."""
+    if isinstance(data_strs, str):
+        data_strs = [data_strs]
     try:
         chipcode, service_url, allowed = fetch_ztp_credentials(
             token, uniqid_hex, monver_hex)
@@ -691,77 +836,373 @@ def fetch_assistnow_mga(token, uniqid_hex, monver_hex, data_str, gnss):
         raise RuntimeError(f"ZTP credentials failed: {exc}")
     print(f"AssistNow ZTP: chipcode obtained (allowedData: {allowed})", file=sys.stderr)
 
-    query = urllib.parse.urlencode(
-        {"chipcode": chipcode, "data": data_str, "gnss": gnss})
-    print(f"AssistNow: GET {service_url} (data={data_str} gnss={gnss})", file=sys.stderr)
-    try:
-        with urllib.request.urlopen(f"{service_url}?{query}", timeout=60) as r:
-            data = r.read()
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"AssistNow data failed ({exc.code}): "
-                           f"{exc.read().decode()[:200]}")
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"AssistNow data failed: {exc}")
-    if len(data) < 8 or data[0] != 0xB5 or data[1] != 0x62:
-        raise RuntimeError(
-            f"AssistNow response is not UBX ({len(data)} bytes): {data[:80]!r}")
-    print(f"  OK -- {len(data)} bytes of UBX-MGA", file=sys.stderr)
-    return data
+    last_err = "no data string tried"
+    for data_str in data_strs:
+        query = urllib.parse.urlencode(
+            {"chipcode": chipcode, "data": data_str, "gnss": gnss})
+        print(f"AssistNow: GET {service_url} (data={data_str} gnss={gnss})",
+              file=sys.stderr)
+        try:
+            with urllib.request.urlopen(f"{service_url}?{query}", timeout=60) as r:
+                data = r.read()
+        except urllib.error.HTTPError as exc:
+            last_err = f"HTTP {exc.code}: {exc.read().decode()[:200]}"
+        except urllib.error.URLError as exc:
+            last_err = str(exc)
+        else:
+            if len(data) < 8 or data[0] != 0xB5 or data[1] != 0x62:
+                last_err = (f"response is not UBX ({len(data)} bytes): "
+                            f"{data[:80]!r}")
+            else:
+                print(f"  OK -- {len(data)} bytes of UBX-MGA", file=sys.stderr)
+                return data, data_str
+        print(f"  rejected ({last_err}) -- trying a smaller request",
+              file=sys.stderr)
+    raise RuntimeError(f"AssistNow data failed: {last_err}")
 
 
-def get_assistnow_blob(token, uniqid_hex, monver_hex, data_str, gnss,
-                       cache_path, max_age_h):
-    """Return the AssistNow MGA blob, reusing a cached copy while it is younger
-    than max_age_h so the service quota is respected even when this script runs
-    hourly. Persist cache_path (+ '.json') between runs (a committed file or
-    actions/cache). Returns bytes, or b'' if unavailable (never fatal)."""
+def get_assistnow_blob(token, uniqid_hex, monver_hex, preset, days, gnss,
+                       cache_path, max_age_h, now=None):
+    """Return (blob, age_h) for the AssistNow MGA data, reusing a cached copy
+    while it is still worth serving so the service quota is respected even when
+    this script runs hourly. Persist cache_path (+ '.json') between runs (a
+    committed file or actions/cache). Returns (b'', 0.0) if unavailable (never
+    fatal).
+
+    Besides max_age_h, a cache entry is rejected once its predicted orbits are
+    for a day already past: an age limit cannot see midnight go by, so a 12 h
+    window happily served yesterday's offline data all morning. age_h is
+    returned so the caller can drop live ephemeris that has since expired.
+    """
+    now = now or datetime.now(timezone.utc)
     meta_path = cache_path + ".json"
+    data_str = assistnow_data_str(preset, days)
+    attempts = assistnow_data_attempts(preset, days)
+    cached_age = None
 
     # Reuse a fresh cache without spending a request.
     try:
         with open(meta_path) as f:
             meta = json.load(f)
-        age_h = (datetime.now(timezone.utc)
-                 - datetime.fromisoformat(meta["fetched_utc"])).total_seconds() / 3600.0
+        cached_age = (now - datetime.fromisoformat(
+            meta["fetched_utc"])).total_seconds() / 3600.0
         params_match = (meta.get("data") == data_str and meta.get("gnss") == gnss)
-        if params_match and age_h < max_age_h:
+        if params_match and cached_age < max_age_h:
             with open(cache_path, "rb") as f:
                 data = f.read()
-            print(f"AssistNow: cache hit ({age_h:.1f} h old, {len(data)} bytes) "
-                  "-- not calling the service", file=sys.stderr)
-            return data
-        print(f"AssistNow: cache stale ({age_h:.1f} h >= {max_age_h} h) or params "
-              "changed -- refreshing", file=sys.stderr)
+            ano_day = ano_latest_day(data)
+            if "uporb" in meta.get("data_used", data_str) and (
+                    ano_day is None or ano_day < now.date()):
+                print(f"AssistNow: cache predicted orbits expired "
+                      f"(latest MGA-ANO day {ano_day}) -- refreshing",
+                      file=sys.stderr)
+            else:
+                print(f"AssistNow: cache hit ({cached_age:.1f} h old, "
+                      f"{len(data)} bytes) -- not calling the service",
+                      file=sys.stderr)
+                return data, cached_age
+        else:
+            print(f"AssistNow: cache stale ({cached_age:.1f} h >= {max_age_h} h) "
+                  "or params changed -- refreshing", file=sys.stderr)
     except (FileNotFoundError, KeyError, ValueError) as exc:
         print(f"AssistNow: no usable cache ({exc}) -- fetching", file=sys.stderr)
 
     # Cache miss / stale: spend one quota request.
     try:
-        data = fetch_assistnow_mga(token, uniqid_hex, monver_hex, data_str, gnss)
+        data, data_used = fetch_assistnow_mga(
+            token, uniqid_hex, monver_hex, attempts, gnss)
     except RuntimeError as exc:
         # Fall back to a stale cache if present -- old aiding beats none, and the
-        # hourly live publish must never break on an AssistNow hiccup.
+        # hourly live publish must never break on an AssistNow hiccup. The age
+        # goes back to the caller so expired parts of it are dropped.
         try:
             with open(cache_path, "rb") as f:
                 data = f.read()
+            age = cached_age if cached_age is not None else 1e6
             print(f"AssistNow: fetch failed, reusing stale cache "
-                  f"({len(data)} bytes): {exc}", file=sys.stderr)
-            return data
+                  f"({len(data)} bytes, {age:.1f} h old): {exc}", file=sys.stderr)
+            return data, age
         except FileNotFoundError:
             print(f"AssistNow: fetch failed and no cache -- live-only this run: "
                   f"{exc}", file=sys.stderr)
-            return b""
+            return b"", 0.0
 
     with open(cache_path, "wb") as f:
         f.write(data)
     with open(meta_path, "w") as f:
         json.dump({
-            "fetched_utc": datetime.now(timezone.utc).isoformat(),
+            "fetched_utc": now.isoformat(),
             "data": data_str,
+            "data_used": data_used,
             "gnss": gnss,
             "bytes": len(data),
         }, f)
-    return data
+    return data, 0.0
+
+
+# ── UBX-MGA stream inspection / sanitising ──────────────────────────────────
+# The published blob is a concatenation of two sources with different lifetimes
+# (live RINEX ephemeris built now, AssistNow aiding served from a cache), so
+# everything that leaves this script is walked frame by frame and anything
+# stale, expired or physically impossible is dropped. That is what keeps the
+# file self-consistent: a receiver applies whatever it finds, silently.
+
+MGA_ID_NAMES = {0x00: "GPS", 0x02: "GAL", 0x03: "BDS", 0x05: "QZSS",
+                0x06: "GLO", 0x20: "ANO", 0x21: "FLASH", 0x40: "INI"}
+MGA_TYPE_EPH = 0x01
+MGA_TYPE_ALM = 0x02
+MGA_ANO      = 0x20
+# Constellation message ids that carry per-SV orbit data (type 1 = ephemeris).
+MGA_GNSS_IDS = (0x00, 0x02, 0x03, 0x05, 0x06)
+
+# Empirically verified against real AssistNow output (u-blox M10 SPG 5.10) and
+# used only for sanity checks, never to rewrite payloads:
+#   msg_id -> (sqrtA offset, LSB exponent, plausible sqrtA windows in m^1/2)
+_ALM_SQRTA = {
+    0x00: (12, -11, [(5100.0, 5200.0)]),                    # GPS  MEO
+    0x05: (12, -11, [(6400.0, 6600.0), (5100.0, 5200.0)]),  # QZSS IGSO/GEO
+    0x03: (8,  -11, [(5200.0, 5350.0), (6400.0, 6600.0)]),  # BDS  MEO / IGSO+GEO
+}
+# msg_id -> offset of the U1 week-number-of-almanac (mod 256). Only the two
+# systems whose value was cross-checked against the real current week.
+_ALM_WNA = {0x00: 6, 0x03: 4}
+# GPS week number of the BeiDou epoch (2006-01-01): BDS week = GPS week - 1356.
+BDS_WEEK_OFFSET = 1356
+
+
+def iter_ubx_frames(blob: bytes):
+    """Walk a UBX stream, yielding (offset, cls, msg_id, payload, ok).
+
+    ok is False for a frame with a bad checksum; a structurally broken frame
+    (lost sync or truncated) is reported with cls=None and ends the walk, so a
+    partially written cache can never leak trailing garbage into the output.
+    """
+    i, n = 0, len(blob)
+    while i + 8 <= n:
+        if blob[i] != 0xB5 or blob[i + 1] != 0x62:
+            yield (i, None, None, b"", False)
+            return
+        ln = struct.unpack_from("<H", blob, i + 4)[0]
+        end = i + 8 + ln
+        if end > n:
+            yield (i, None, None, b"", False)
+            return
+        payload = blob[i + 6:i + 6 + ln]
+        ck_a, ck_b = _ubx_checksum(blob[i + 2:i + 6 + ln])
+        yield (i, blob[i + 2], blob[i + 3], payload,
+               ck_a == blob[end - 2] and ck_b == blob[end - 1])
+        i = end
+    if i != n:
+        yield (i, None, None, b"", False)
+
+
+def _frame_bytes(blob: bytes, offset: int, payload_len: int) -> bytes:
+    return blob[offset:offset + 8 + payload_len]
+
+
+def _ano_date(payload: bytes):
+    """(year, month, day) of a UBX-MGA-ANO record, or None if unparsable."""
+    if len(payload) < 7:
+        return None
+    return (2000 + payload[4], payload[5], payload[6])
+
+
+def ano_latest_day(blob: bytes):
+    """Most recent MGA-ANO date in a blob as a date, or None if it has none.
+    Used to decide whether cached predicted orbits are still worth serving."""
+    latest = None
+    for _, cls, msg_id, payload, ok in iter_ubx_frames(blob):
+        if not ok or cls != UBX_CLASS_MGA or msg_id != MGA_ANO:
+            continue
+        d = _ano_date(payload)
+        if d is None:
+            continue
+        try:
+            day = datetime(d[0], d[1], d[2], tzinfo=timezone.utc).date()
+        except ValueError:
+            continue
+        if latest is None or day > latest:
+            latest = day
+    return latest
+
+
+def _alm_sqrta_ok(msg_id: int, payload: bytes):
+    """(ok, value) for the almanac semi-major-axis sanity check."""
+    spec = _ALM_SQRTA.get(msg_id)
+    if spec is None:
+        return True, None
+    off, exp, windows = spec
+    if len(payload) < off + 4:
+        return True, None
+    val = struct.unpack_from("<I", payload, off)[0] * 2.0 ** exp
+    return any(lo <= val <= hi for lo, hi in windows), val
+
+
+def _alm_stale_weeks(msg_id: int, payload: bytes, now: datetime):
+    """How many weeks old the almanac's WNa is, or None if not checkable."""
+    off = _ALM_WNA.get(msg_id)
+    if off is None or len(payload) <= off:
+        return None
+    gps_week = _week_sow(now)[0]
+    cur = (gps_week - BDS_WEEK_OFFSET if msg_id == 0x03 else gps_week) % 256
+    return (cur - payload[off]) % 256
+
+
+def sanitize_mga_stream(blob: bytes, now: datetime, blob_age_h: float = 0.0,
+                        live_max_age_h: float = 4.0,
+                        alm_max_stale_weeks: int = 26,
+                        keep_ini: bool = False, label: str = "AssistNow"):
+    """Filter a UBX-MGA stream into something safe to publish.
+
+    Dropped: broken frames, UBX-MGA-INI-* (unless keep_ini -- a cached INI-TIME
+    is what makes a served file claim the wrong hour), MGA-ANO for days already
+    past, live ephemeris older than live_max_age_h (the blob's own age, since
+    live orbits expire within hours), and almanac records with an impossible
+    orbit or a week-of-almanac older than alm_max_stale_weeks.
+
+    Returns (clean_bytes, stats) -- stats maps a reason to a dropped count.
+    """
+    today = now.date()
+    live_stale = blob_age_h > live_max_age_h
+    kept, dropped = [], {}
+
+    def drop(reason):
+        dropped[reason] = dropped.get(reason, 0) + 1
+
+    for off, cls, msg_id, payload, ok in iter_ubx_frames(blob):
+        if cls is None:
+            drop("broken frame (walk stopped)")
+            break
+        if not ok:
+            drop("bad checksum")
+            continue
+        frame = _frame_bytes(blob, off, len(payload))
+        mtype = payload[0] if payload else None
+
+        if cls == UBX_CLASS_MGA and msg_id == MGA_INI and not keep_ini:
+            drop("MGA-INI (stale time/position)")
+            continue
+
+        if cls == UBX_CLASS_MGA and msg_id == MGA_ANO:
+            d = _ano_date(payload)
+            try:
+                day = datetime(d[0], d[1], d[2], tzinfo=timezone.utc).date()
+            except (TypeError, ValueError):
+                drop("MGA-ANO unparsable date")
+                continue
+            if day < today:
+                drop("MGA-ANO expired (%s)" % day)
+                continue
+
+        if cls == UBX_CLASS_MGA and msg_id in MGA_GNSS_IDS:
+            if mtype == MGA_TYPE_EPH and live_stale:
+                drop("live ephemeris %.1f h old (> %.1f h)"
+                     % (blob_age_h, live_max_age_h))
+                continue
+            if mtype == MGA_TYPE_ALM:
+                sane, val = _alm_sqrta_ok(msg_id, payload)
+                if not sane:
+                    print("  %s: dropping %s-ALM sv=%d -- impossible orbit "
+                          "(sqrtA=%.1f m^1/2)"
+                          % (label, MGA_ID_NAMES.get(msg_id, "?"),
+                             payload[2] if len(payload) > 2 else -1, val),
+                          file=sys.stderr)
+                    drop("almanac impossible orbit")
+                    continue
+                stale = _alm_stale_weeks(msg_id, payload, now)
+                if stale is not None and stale > alm_max_stale_weeks:
+                    print("  %s: dropping %s-ALM sv=%d -- WNa %d weeks stale"
+                          % (label, MGA_ID_NAMES.get(msg_id, "?"),
+                             payload[2] if len(payload) > 2 else -1, stale),
+                          file=sys.stderr)
+                    drop("almanac stale WNa")
+                    continue
+
+        kept.append(frame)
+
+    return b"".join(kept), dropped
+
+
+def describe_ubx(blob: bytes, now: datetime = None, served: bool = True):
+    """Return (lines, problems) describing a UBX-MGA blob.
+
+    Structural verification of every frame plus a physical plausibility check on
+    the GPS ephemeris -- a wrong field offset shows up instantly as a nonsense
+    semi-major axis, which is exactly how the missing type/version header used
+    to hide behind a valid checksum.
+    """
+    now = now or datetime.now(timezone.utc)
+    # served=True means the blob is published at a URL and read hours later, so
+    # a baked-in MGA-INI time is a defect; for a blob injected right now it is
+    # exactly what is wanted.
+    counts, problems, lines = {}, [], []
+    ano_days, prns, total, bad_cks = {}, [], 0, 0
+
+    for off, cls, msg_id, payload, ok in iter_ubx_frames(blob):
+        if cls is None:
+            problems.append("stream desync / truncated frame at byte %d" % off)
+            break
+        total += 1
+        if not ok:
+            bad_cks += 1
+            problems.append("bad checksum at byte %d (cls=%02X id=%02X)"
+                            % (off, cls, msg_id))
+            continue
+        mtype = payload[0] if payload else None
+        key = (cls, msg_id, mtype, len(payload))
+        counts[key] = counts.get(key, 0) + 1
+
+        if cls == UBX_CLASS_MGA and msg_id == MGA_ANO:
+            d = _ano_date(payload)
+            if d:
+                ano_days["%04d-%02d-%02d" % d] = ano_days.get("%04d-%02d-%02d" % d, 0) + 1
+        if cls == UBX_CLASS_MGA and msg_id == MGA_GPS and len(payload) == 68:
+            # 68 bytes is the ephemeris payload size, so whatever the first byte
+            # says, this frame has to be a well-formed EPH.
+            if mtype == MGA_TYPE_EPH:
+                prns.append(payload[2])
+            try:
+                _check_gps_eph_layout(payload)
+            except ValueError as exc:
+                problems.append("MGA-GPS-EPH at byte %d: %s" % (off, exc))
+
+    lines.append("UBX frames: %d, %d bytes, %d bad checksum(s)"
+                 % (total, len(blob), bad_cks))
+    for (cls, msg_id, mtype, ln), n in sorted(counts.items()):
+        name = MGA_ID_NAMES.get(msg_id, "%02X" % msg_id) if cls == UBX_CLASS_MGA \
+            else "cls%02X" % cls
+        tname = {MGA_TYPE_EPH: "EPH", MGA_TYPE_ALM: "ALM"}.get(mtype, "type%s" % mtype)
+        if msg_id in (MGA_ANO, MGA_INI):
+            tname = "type%s" % mtype
+        lines.append("  MGA-%-5s %-7s len=%-3d x%d" % (name, tname, ln, n))
+    if prns:
+        lines.append("  GPS EPH PRNs (%d): %s" % (len(prns), sorted(prns)))
+        missing = sorted(set(range(1, 33)) - set(prns))
+        if missing:
+            lines.append("  GPS EPH missing PRNs: %s" % missing)
+    if ano_days:
+        lines.append("  MGA-ANO days: %s"
+                     % ", ".join("%s x%d" % kv for kv in sorted(ano_days.items())))
+        today = now.strftime("%Y-%m-%d")
+        expired = [d for d in ano_days if d < today]
+        if expired:
+            problems.append("MGA-ANO already expired: %s" % ", ".join(sorted(expired)))
+    for (cls, msg_id, mtype, _ln), n in sorted(counts.items()):
+        if served and cls == UBX_CLASS_MGA and msg_id == MGA_INI:
+            problems.append("%d MGA-INI frame(s) present: a served file must not "
+                            "carry a fixed time/position" % n)
+    return lines, problems
+
+
+def report_blob(label: str, blob: bytes, now: datetime, served: bool = True) -> list:
+    """Print an inventory of a blob and return its list of problems."""
+    lines, problems = describe_ubx(blob, now, served=served)
+    print(f"\n{label}:", file=sys.stderr)
+    for line in lines:
+        print(f"  {line}", file=sys.stderr)
+    for prob in problems:
+        print(f"  PROBLEM: {prob}", file=sys.stderr)
+    return problems
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -778,9 +1219,20 @@ def main():
     ap.add_argument("--source", choices=["auto", "hourly", "daily"], default="auto",
                     help="Ephemeris source: 'hourly' = freshest (<1 h, best hot "
                          "start), 'daily' = whole-day file, 'auto' (default) = "
-                         "hourly then fall back to daily")
+                         "hourly, topped up from the daily file if coverage is thin")
+    ap.add_argument("--min-prns", type=int, default=30,
+                    help="Keep pulling hourly stations (then the daily file) until "
+                         "this many GPS PRNs are covered (default: 30)")
     ap.add_argument("--stats", action="store_true",
-                    help="Print content summary")
+                    help="Print the content summary on stdout as well as stderr")
+    ap.add_argument("--verify", metavar="FILE", default=None,
+                    help="Inspect an existing .ubx file and exit: frame inventory, "
+                         "checksums, MGA-GPS-EPH field alignment, MGA-ANO expiry. "
+                         "Exits non-zero if a problem is found.")
+    ap.add_argument("--no-strict", action="store_true",
+                    help="Write the output even when verification finds a problem "
+                         "(by default a broken blob is not written, so a publishing "
+                         "job keeps serving the previous good file)")
     # ── Device hot-start injection ────────────────────────────────────────────
     ap.add_argument("--format", choices=["bin", "shell"], default="bin",
                     help="bin = write .ubx file (default); "
@@ -812,14 +1264,34 @@ def main():
                          "ASSISTNOW_TOKEN env var. When set, an AssistNow UBX-MGA stream "
                          "(live ephemeris and/or predicted orbits) is merged into the "
                          "output. Keep it SECRET: pass via env / CI secret, never commit it.")
-    ap.add_argument("--assistnow-data", choices=["predictive", "live", "both"],
+    ap.add_argument("--assistnow-data", choices=list(ASSISTNOW_PRESETS),
                     default="both",
                     help="Which aiding to fetch: 'predictive' (multi-day MGA-ANO orbits), "
-                         "'live' (current ephemeris, best TTFF, expires in hours), or "
-                         "'both' (default; one request).")
+                         "'live' (current ephemeris for every constellation, best TTFF, "
+                         "expires in hours), or 'both' (default; one request).")
+    ap.add_argument("--assistnow-days", type=int, default=3,
+                    help="Days of predicted orbits (MGA-ANO) to request, 1-14 "
+                         "(default: 3). One day expires at the next UTC midnight, "
+                         "which leaves the offline data useless the morning after.")
     ap.add_argument("--assistnow-gnss", default="gps,gal,glo,bds,qzss",
                     help="Constellations for AssistNow, comma-separated "
                          "(default: gps,gal,glo,bds,qzss).")
+    ap.add_argument("--assistnow-output", default=None, metavar="FILE",
+                    help="Write the AssistNow aiding to its own file instead of "
+                         "appending it to --output. Keeps the two sources, whose "
+                         "contents have very different lifetimes, from being served "
+                         "as one blob that looks internally inconsistent.")
+    ap.add_argument("--assistnow-live-max-age-h", type=float, default=4.0,
+                    help="Drop live ephemeris from a cached AssistNow blob older "
+                         "than this (default: 4 h, the GPS fit interval). Almanac "
+                         "and predicted orbits are kept.")
+    ap.add_argument("--alm-max-stale-weeks", type=int, default=26,
+                    help="Drop almanac records whose week-of-almanac is more than "
+                         "this many weeks old (default: 26)")
+    ap.add_argument("--keep-assistnow-ini", action="store_true",
+                    help="Keep the MGA-INI-TIME frame that AssistNow includes. Off "
+                         "by default: it carries the time of the fetch, so a served "
+                         "or cached file would tell the receiver the wrong hour.")
     ap.add_argument("--uniqid", default=os.environ.get("UBX_SEC_UNIQID", DEFAULT_UNIQID),
                     help="Target module UBX-SEC-UNIQID response as hex (full UBX frame). "
                          "Defaults to the built-in MAX-M10S; authorizes the ZTP request "
@@ -834,24 +1306,45 @@ def main():
     ap.add_argument("--assistnow-max-age-h", type=float, default=None,
                     help="Only re-fetch when the cache is older than this. Default depends "
                          "on --assistnow-data: 12 h for 'predictive', 1 h for 'live'/'both' "
-                         "(live orbits expire fast).")
+                         "(live orbits expire fast). A cache whose predicted orbits are for "
+                         "a past day is refreshed regardless.")
     args = ap.parse_args()
 
     now = datetime.now(timezone.utc)
 
+    # ── Verify-only mode: inspect a file someone else produced ───────────────
+    if args.verify:
+        with open(args.verify, "rb") as f:
+            blob = f.read()
+        problems = report_blob(f"Verifying {args.verify}", blob, now)
+        raise SystemExit(1 if problems else 0)
+
+    strict = not args.no_strict
     all_records = []
 
     # 1. Hourly source first (freshest → best hot start), unless the user forced
     #    a daily source or a specific past --date.
     if args.source in ("auto", "hourly") and not args.date:
-        htext, _ = download_rinex_hourly(now)
-        if htext:
-            all_records = parse_gps_nav(htext)
-            print(f"Parsed {len(all_records)} GPS records from hourly data",
-                  file=sys.stderr)
+        hourly, _ = download_rinex_hourly(now, max_age_h=args.max_age_h,
+                                          min_prns=args.min_prns)
+        if hourly:
+            all_records = hourly
 
-    # 2. Daily source (fallback, or when explicitly requested / dated).
-    if not all_records and args.source != "hourly":
+    # 2. Daily source: the fallback when hourly is unavailable, and the top-up
+    #    when the hourly stations that answered did not see the whole
+    #    constellation (filter_fresh_now keeps the freshest record per PRN, so
+    #    merging the two can only add coverage).
+    _, now_sow = _week_sow(now)
+    fresh_prns = {r["prn"] for r in all_records
+                  if _record_age_h(r, now_sow) <= args.max_age_h}
+    want_daily = (args.source == "daily"
+                  or (not all_records and args.source != "hourly")
+                  or (args.source == "auto" and len(fresh_prns) < args.min_prns))
+    if want_daily:
+        if all_records:
+            print(f"Hourly data has fresh ephemeris for {len(fresh_prns)} PRNs "
+                  f"(< {args.min_prns}) — topping up from the daily file",
+                  file=sys.stderr)
         if args.date:
             rinex_date = datetime.strptime(args.date, "%Y-%m-%d").replace(
                 tzinfo=timezone.utc)
@@ -865,9 +1358,9 @@ def main():
             except RuntimeError:
                 pass
         if text:
-            all_records = parse_gps_nav(text)
-            print(f"Parsed {len(all_records)} GPS records from daily data",
-                  file=sys.stderr)
+            daily = parse_gps_nav(text)
+            print(f"Parsed {len(daily)} GPS records from daily data", file=sys.stderr)
+            all_records += daily
 
     if not all_records:
         raise SystemExit("ERROR: Could not download ephemeris from any source.")
@@ -910,30 +1403,49 @@ def main():
     if conversion_errors:
         print(f"Warning: {conversion_errors} records failed conversion", file=sys.stderr)
 
-    if args.stats:
-        print_stats(frames, fresh)
-
     binary = b"".join(frames)
 
-    # ── Merge AssistNow aiding (ZTP) after the live RINEX ephemeris ─────────
-    # The device injects any UBX-MGA frames in the blob, so the AssistNow stream
-    # (live ephemeris and/or predicted MGA-ANO) rides along with no firmware
-    # change. Cache-gated so the service quota is respected even when run hourly.
+    # ── AssistNow aiding (ZTP) ──────────────────────────────────────────────
+    # The device injects any UBX-MGA frames it is handed, so the AssistNow
+    # stream (live ephemeris for every constellation and/or predicted MGA-ANO)
+    # needs no firmware change. It is cache-gated for the service quota and
+    # sanitised before use: the cached blob carries the time of its own fetch
+    # and orbits that expire, neither of which may leak into a published file.
+    aiding = b""
     if args.assistnow_token:
-        data_str = ASSISTNOW_DATA[args.assistnow_data]
         max_age_h = (args.assistnow_max_age_h if args.assistnow_max_age_h is not None
                      else ASSISTNOW_DEFAULT_MAX_AGE_H[args.assistnow_data])
-        aiding = get_assistnow_blob(
-            args.assistnow_token, args.uniqid, args.monver, data_str,
-            args.assistnow_gnss, args.assistnow_cache, max_age_h)
-        if aiding:
-            binary += aiding
-            print(f"Merged {len(aiding)} bytes of AssistNow aiding "
-                  f"({args.assistnow_data}); blob now {len(binary)} bytes",
-                  file=sys.stderr)
+        raw, age_h = get_assistnow_blob(
+            args.assistnow_token, args.uniqid, args.monver, args.assistnow_data,
+            args.assistnow_days, args.assistnow_gnss, args.assistnow_cache,
+            max_age_h, now)
+        if raw:
+            aiding, dropped = sanitize_mga_stream(
+                raw, now, blob_age_h=age_h,
+                live_max_age_h=args.assistnow_live_max_age_h,
+                alm_max_stale_weeks=args.alm_max_stale_weeks,
+                keep_ini=args.keep_assistnow_ini and not args.no_ini)
+            for reason, count in sorted(dropped.items()):
+                print(f"  AssistNow: dropped {count} frame(s) — {reason}",
+                      file=sys.stderr)
+            print(f"AssistNow aiding: {len(aiding)} bytes kept of {len(raw)} "
+                  f"({args.assistnow_data}, {age_h:.1f} h old)", file=sys.stderr)
     else:
         print("No AssistNow token (--assistnow-token / ASSISTNOW_TOKEN) -- live-only "
               "output", file=sys.stderr)
+
+    # Two files or one: kept apart, each file has a single source and a single
+    # lifetime; merged, a receiver cannot tell which half is which.
+    if aiding and not args.assistnow_output:
+        binary += aiding
+        print(f"Merged AssistNow aiding into {args.output}; blob now "
+              f"{len(binary)} bytes", file=sys.stderr)
+
+    problems = report_blob(f"Live RINEX blob ({args.output})", binary, now,
+                           served=args.no_ini)
+    if args.stats:
+        for line in describe_ubx(binary, now, served=args.no_ini)[0]:
+            print(line)
 
     # ── Output / injection ────────────────────────────────────────────────────
     if args.port:
@@ -948,11 +1460,33 @@ def main():
               f"lines above into the board shell", file=sys.stderr)
         return
 
-    # Default: write the raw .ubx binary.
-    with open(args.output, "wb") as f:
-        f.write(binary)
+    # ── Output ────────────────────────────────────────────────────────────
+    # Each file stands or falls on its own: a problem with one must not stop the
+    # other from being published, and nothing is overwritten with a blob that
+    # failed verification -- the previously published file is better than a
+    # broken one, since a receiver applies whatever it is given.
+    writes = [(args.output, binary, problems)]
+    if args.assistnow_output:
+        writes.append((args.assistnow_output, aiding,
+                       report_blob(f"AssistNow blob ({args.assistnow_output})",
+                                   aiding, now)))
+    failures = 0
+    for path, blob, probs in writes:
+        if not blob:
+            print(f"WARNING: nothing to write to {path} — left untouched so the "
+                  f"last good file keeps being served", file=sys.stderr)
+            continue
+        if probs and strict:
+            print(f"ERROR: {len(probs)} problem(s) in the blob for {path}; "
+                  f"refusing to write it (--no-strict overrides)", file=sys.stderr)
+            failures += 1
+            continue
+        with open(path, "wb") as f:
+            f.write(blob)
+        print(f"Wrote {len(blob)} bytes → {path}")
+    if failures:
+        raise SystemExit(f"ERROR: {failures} output file(s) not written")
 
-    print(f"\nWrote {len(binary)} bytes ({len(frames)} UBX frames) → {args.output}")
     print("\nInject into the board (online hot start):")
     print(f"    python3 {sys.argv[0]} --port /dev/ttyACM0          # auto-stream + fix")
     print(f"    python3 {sys.argv[0]} --format shell | <paste>     # manual paste")
