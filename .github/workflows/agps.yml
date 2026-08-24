@@ -28,9 +28,12 @@ jobs:
       #
       # Two files, one run, one AssistNow request:
       #   latest.ubx        u-blox AssistNow: almanac for all five
-      #                     constellations + one day of predicted orbits
-      #                     (MGA-ANO). Live ephemeris is asked for too, but
-      #                     this profile is not entitled to it.
+      #                     constellations + predicted orbits (MGA-ANO), and
+      #                     the ionosphere model and satellite health when the
+      #                     profile serves them. Live ephemeris is asked for
+      #                     too; this profile has been refusing it, and the
+      #                     'data_used' field of the cache metadata records
+      #                     what it accepted on the last fetch.
       #   latest_rinex.ubx  free RINEX broadcast ephemeris, GPS only, hourly
       # Kept apart because their contents expire on completely different
       # timescales; merged, the served blob looked internally inconsistent

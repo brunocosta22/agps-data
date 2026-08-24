@@ -763,37 +763,58 @@ DEFAULT_MONVER = (
     "0000000000000000000000000000000046ba"
 )
 
-# --assistnow-data preset -> the service 'data=' string. 'both' rides live
-# ephemeris and multi-day predicted orbits in a single request (same quota).
-# 'uporb_N' asks for N days of predicted orbits: a single day expires at the
-# next UTC midnight, which is how a file published at 09:00 ended up carrying
-# nothing but yesterday's offline data.
+# Components of the service 'data=' string:
+#   uporb_N   N days of predicted orbits (MGA-ANO, the AssistNow Offline part).
+#             A single day expires at the next UTC midnight, which is how a file
+#             published at 09:00 ended up carrying yesterday's offline data.
+#   ulorb_l1  live L1 ephemeris for every constellation (AssistNow Online).
+#             A separate entitlement from Offline on a Thingstream profile.
+#   ukion     Klobuchar ionosphere coefficients. Worth asking for: a single-band
+#             receiver needs them to correct several metres of delay, and off the
+#             air GPS only repeats them once per 12.5 min page cycle.
+#   usvht     satellite health.
+#   ualm      almanac.
 ASSISTNOW_PRESETS = ("predictive", "live", "both")
-
-
-def assistnow_data_str(preset: str, days: int = 3) -> str:
-    porb = f"uporb_{max(1, min(14, int(days)))}"
-    return {
-        "predictive": f"{porb},ualm",
-        "live":       "ulorb_l1,ukion,usvht,ualm",
-        "both":       f"{porb},ulorb_l1,ukion,usvht,ualm",
-    }[preset]
+_AN_EXTRAS = "ukion,usvht,ualm"
+# The one combination this profile is known to be served; the floor of every
+# chain, so a fetch never comes back empty because the ask was too ambitious.
+_AN_FLOOR = "uporb_1,ualm"
 
 
 def assistnow_data_attempts(preset: str, days: int) -> list:
     """The 'data=' strings to try, most complete first.
 
-    A device profile is not necessarily entitled to multi-day predicted orbits,
-    and a rejected request must not cost the whole fetch, so the multi-day ask
-    degrades to a single day and then to live-only aiding.
+    Each step drops exactly one thing, so a rejection says *what* the profile is
+    not entitled to rather than merely being smaller. Live orbits go first
+    (Online is a separate entitlement from Offline), then the extra days, and
+    only then the ionosphere and health extras -- which the previous chain could
+    never tell apart, because every variant carrying them also carried live
+    orbits, so three rejections in a row proved nothing about the ionosphere.
     """
-    out = [assistnow_data_str(preset, days)]
-    for fallback in (assistnow_data_str(preset, 1),
-                     assistnow_data_str("live", 1),
-                     assistnow_data_str("predictive", 1)):
-        if fallback not in out:
-            out.append(fallback)
-    return out
+    d = max(1, min(14, int(days)))
+    porb = f"uporb_{d}"
+    out = []
+    if preset == "both":
+        out.append(f"{porb},ulorb_l1,{_AN_EXTRAS}")
+    elif preset == "live":
+        out.append(f"ulorb_l1,{_AN_EXTRAS}")
+    if preset in ("predictive", "both"):
+        out.append(f"{porb},{_AN_EXTRAS}")
+        if d > 1:
+            out.append(f"uporb_1,{_AN_EXTRAS}")
+    out.append(_AN_FLOOR)
+    seen, uniq = set(), []
+    for s in out:
+        if s not in seen:
+            seen.add(s)
+            uniq.append(s)
+    return uniq
+
+
+def assistnow_data_str(preset: str, days: int = 3) -> str:
+    """The preferred (most complete) request for a preset -- also the key the
+    cache is matched on, so changing what is asked for forces one refresh."""
+    return assistnow_data_attempts(preset, days)[0]
 
 
 # Default cache lifetime per mode: predicted orbits stay valid for days, live
@@ -896,8 +917,9 @@ def get_assistnow_blob(token, uniqid_hex, monver_hex, preset, days, gnss,
             meta = json.load(f)
         fetched = datetime.fromisoformat(meta["fetched_utc"])
         cached_age = (now - fetched).total_seconds() / 3600.0
-        known_good, last_fetch_day = meta.get("data_used"), fetched.date()
         params_match = (meta.get("data") == data_str and meta.get("gnss") == gnss)
+        if params_match:
+            known_good, last_fetch_day = meta.get("data_used"), fetched.date()
         if params_match and cached_age < max_age_h:
             with open(cache_path, "rb") as f:
                 data = f.read()
@@ -969,6 +991,10 @@ MGA_ID_NAMES = {0x00: "GPS", 0x02: "GAL", 0x03: "BDS", 0x05: "QZSS",
                 0x06: "GLO", 0x20: "ANO", 0x21: "FLASH", 0x40: "INI"}
 MGA_TYPE_EPH = 0x01
 MGA_TYPE_ALM = 0x02
+# Message types inside a per-constellation MGA message, so an inventory says
+# what aiding actually arrived instead of a bare number.
+MGA_TYPE_NAMES = {0x01: "EPH", 0x02: "ALM", 0x03: "TIMEOFF", 0x04: "HEALTH",
+                  0x05: "UTC", 0x06: "IONO"}
 MGA_ANO      = 0x20
 # Constellation message ids that carry per-SV orbit data (type 1 = ephemeris).
 MGA_GNSS_IDS = (0x00, 0x02, 0x03, 0x05, 0x06)
@@ -1189,7 +1215,7 @@ def describe_ubx(blob: bytes, now: datetime = None, served: bool = True):
     for (cls, msg_id, mtype, ln), n in sorted(counts.items()):
         name = MGA_ID_NAMES.get(msg_id, "%02X" % msg_id) if cls == UBX_CLASS_MGA \
             else "cls%02X" % cls
-        tname = {MGA_TYPE_EPH: "EPH", MGA_TYPE_ALM: "ALM"}.get(mtype, "type%s" % mtype)
+        tname = MGA_TYPE_NAMES.get(mtype, "type%s" % mtype)
         if msg_id in (MGA_ANO, MGA_INI):
             tname = "type%s" % mtype
         lines.append("  MGA-%-5s %-7s len=%-3d x%d" % (name, tname, ln, n))
