@@ -19,10 +19,19 @@ jobs:
         run: |
           echo "TS=$(date -u +%Y%m%d_%H%M)" >> $GITHUB_ENV
 
+      # 12 h, not hourly: this device profile is only entitled to
+      # 'uporb_1,ualm' (the richer requests come back rejected), and predicted
+      # orbits plus almanac for the day do not go stale within the day. The
+      # cache is refreshed anyway the moment its MGA-ANO are for a past day, so
+      # the midnight rollover is covered without spending the service quota --
+      # which, at one attempt per hour, ran out before mid-morning.
+      #
       # Two files, one run, one AssistNow request:
-      #   latest.ubx        u-blox AssistNow (almanac + ionosphere + predicted
-      #                     orbits + live ephemeris for every constellation)
-      #   latest_rinex.ubx  free RINEX broadcast ephemeris, GPS only
+      #   latest.ubx        u-blox AssistNow: almanac for all five
+      #                     constellations + one day of predicted orbits
+      #                     (MGA-ANO). Live ephemeris is asked for too, but
+      #                     this profile is not entitled to it.
+      #   latest_rinex.ubx  free RINEX broadcast ephemeris, GPS only, hourly
       # Kept apart because their contents expire on completely different
       # timescales; merged, the served blob looked internally inconsistent
       # (a cached INI-TIME from one half dating the other half's ephemeris).
@@ -42,7 +51,7 @@ jobs:
               --assistnow-data both \
               --assistnow-days 3 \
               --assistnow-cache docs/agps_assistnow_cache.ubx \
-              --assistnow-max-age-h 2
+              --assistnow-max-age-h 12
 
       - name: Cleanup old files
         run: |

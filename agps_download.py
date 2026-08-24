@@ -818,12 +818,19 @@ def fetch_ztp_credentials(token, uniqid_hex, monver_hex):
     return creds["chipcode"], creds["serviceUrl"], creds.get("allowedData", "")
 
 
+# HTTP statuses that mean "this device profile may not ask for that", and so
+# justify retrying with a smaller request. Anything else -- 429, 5xx, a network
+# fault -- means come back later: walking the rest of the chain would spend
+# three more requests of a quota that is already refusing us.
+_ASSISTNOW_DOWNGRADE_CODES = (400, 401, 403, 404, 422)
+
+
 def fetch_assistnow_mga(token, uniqid_hex, monver_hex, data_strs, gnss):
     """Full ZTP AssistNow fetch (credentials -> data). Returns (raw UBX-MGA
     bytes, the 'data=' string that worked) or raises RuntimeError. Consumes
     service quota -- call only via get_assistnow_blob() so the cache gates it.
     The credentials are fetched once and reused across the data-string
-    fallbacks, so a downgraded request costs no extra quota."""
+    fallbacks, so a downgraded request costs no extra credentials call."""
     if isinstance(data_strs, str):
         data_strs = [data_strs]
     try:
@@ -847,8 +854,11 @@ def fetch_assistnow_mga(token, uniqid_hex, monver_hex, data_strs, gnss):
                 data = r.read()
         except urllib.error.HTTPError as exc:
             last_err = f"HTTP {exc.code}: {exc.read().decode()[:200]}"
+            if exc.code not in _ASSISTNOW_DOWNGRADE_CODES:
+                raise RuntimeError(f"AssistNow data failed, not retrying "
+                                   f"({last_err})")
         except urllib.error.URLError as exc:
-            last_err = str(exc)
+            raise RuntimeError(f"AssistNow data failed: {exc}")
         else:
             if len(data) < 8 or data[0] != 0xB5 or data[1] != 0x62:
                 last_err = (f"response is not UBX ({len(data)} bytes): "
@@ -878,14 +888,15 @@ def get_assistnow_blob(token, uniqid_hex, monver_hex, preset, days, gnss,
     meta_path = cache_path + ".json"
     data_str = assistnow_data_str(preset, days)
     attempts = assistnow_data_attempts(preset, days)
-    cached_age = None
+    cached_age, known_good, last_fetch_day = None, None, None
 
     # Reuse a fresh cache without spending a request.
     try:
         with open(meta_path) as f:
             meta = json.load(f)
-        cached_age = (now - datetime.fromisoformat(
-            meta["fetched_utc"])).total_seconds() / 3600.0
+        fetched = datetime.fromisoformat(meta["fetched_utc"])
+        cached_age = (now - fetched).total_seconds() / 3600.0
+        known_good, last_fetch_day = meta.get("data_used"), fetched.date()
         params_match = (meta.get("data") == data_str and meta.get("gnss") == gnss)
         if params_match and cached_age < max_age_h:
             with open(cache_path, "rb") as f:
@@ -907,7 +918,14 @@ def get_assistnow_blob(token, uniqid_hex, monver_hex, preset, days, gnss,
     except (FileNotFoundError, KeyError, ValueError) as exc:
         print(f"AssistNow: no usable cache ({exc}) -- fetching", file=sys.stderr)
 
-    # Cache miss / stale: spend one quota request.
+    # Cache miss / stale: spend one quota request. Lead with whatever the
+    # service accepted last time, unless this is the first fetch of a new UTC
+    # day -- then the full request is worth one more try, so an entitlement that
+    # has since been upgraded is picked up without anyone editing this file.
+    if known_good in attempts and last_fetch_day == now.date():
+        attempts = [known_good] + [a for a in attempts if a != known_good]
+        print(f"AssistNow: leading with the last accepted request "
+              f"({known_good})", file=sys.stderr)
     try:
         data, data_used = fetch_assistnow_mga(
             token, uniqid_hex, monver_hex, attempts, gnss)
