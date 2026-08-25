@@ -862,40 +862,55 @@ _AN_EXTRAS = "ukion,usvht,ualm"
 _AN_FLOOR = "uporb_1,ualm"
 
 
-def assistnow_data_attempts(preset: str, days: int) -> list:
+def assistnow_data_attempts(preset: str, days: int, almanac: bool = False) -> list:
     """The 'data=' strings to try, most complete first.
 
     Each step drops exactly one thing, so a rejection says *what* the profile is
     not entitled to rather than merely being smaller. Live orbits go first
-    (Online is a separate entitlement from Offline), then the extra days, and
-    only then the ionosphere and health extras -- which the previous chain could
-    never tell apart, because every variant carrying them also carried live
-    orbits, so three rejections in a row proved nothing about the ionosphere.
+    (Online is a separate entitlement from Offline), then the extra days, then
+    the ionosphere and health extras -- the service counts those as Live too,
+    which is why a request for three days of orbits carrying them came back
+    "Access to Live Orbits is not allowed" and made the extra days look
+    unavailable when allowedData offered fourteen.
+
+    The almanac is off by default: it is coarse orbit data for the same
+    satellites the predicted orbits already cover far better, and it is 29% of
+    the published file. The rungs that carry it stay at the tail all the same --
+    'uporb_N,ualm' is the only shape the service has actually been seen to
+    accept, so if a lean request turns out to be invalid the run still comes
+    back with aiding instead of nothing.
     """
     d = max(1, min(14, int(days)))
-    porb = f"uporb_{d}"
+    porb = [f"uporb_{d}"] if preset in ("predictive", "both") else []
+    one = ["uporb_1"] if preset in ("predictive", "both") else []
+    live = ["ulorb_l1"] if preset in ("live", "both") else []
+    extras = ["ukion", "usvht"]
+    alm = ["ualm"] if almanac else []
+
+    ladder = []
+    if live:
+        ladder.append(porb + live + extras + alm)
+    if porb:
+        ladder.append(porb + extras + alm)
+        ladder.append(one + extras + alm)
+        ladder.append(porb + alm)
+    ladder.append((one or live) + alm)
+    if not almanac:
+        ladder.append(porb + ["ualm"])
+        ladder.append((one or live) + ["ualm"])
+
     out = []
-    if preset == "both":
-        out.append(f"{porb},ulorb_l1,{_AN_EXTRAS}")
-    elif preset == "live":
-        out.append(f"ulorb_l1,{_AN_EXTRAS}")
-    if preset in ("predictive", "both"):
-        out.append(f"{porb},{_AN_EXTRAS}")
-        if d > 1:
-            out.append(f"uporb_1,{_AN_EXTRAS}")
-    out.append(_AN_FLOOR)
-    seen, uniq = set(), []
-    for s in out:
-        if s not in seen:
-            seen.add(s)
-            uniq.append(s)
-    return uniq
+    for parts in ladder:
+        spec = ",".join(parts)
+        if spec and spec not in out:
+            out.append(spec)
+    return out
 
 
-def assistnow_data_str(preset: str, days: int = 3) -> str:
+def assistnow_data_str(preset: str, days: int = 3, almanac: bool = False) -> str:
     """The preferred (most complete) request for a preset -- also the key the
     cache is matched on, so changing what is asked for forces one refresh."""
-    return assistnow_data_attempts(preset, days)[0]
+    return assistnow_data_attempts(preset, days, almanac)[0]
 
 
 # Default cache lifetime per mode: predicted orbits stay valid for days, live
@@ -1007,7 +1022,8 @@ def fetch_assistnow_mga(token, uniqid_hex, monver_hex, data_strs, gnss):
 
 
 def get_assistnow_blob(token, uniqid_hex, monver_hex, preset, days, gnss,
-                       cache_path, max_age_h, now=None, retry_h=3.0):
+                       cache_path, max_age_h, now=None, retry_h=3.0,
+                       almanac=False):
     """Return (blob, age_h) for the AssistNow MGA data, reusing a cached copy
     while it is still worth serving. Persist cache_path (+ '.json') between runs
     (a committed file or actions/cache). Returns (b'', 0.0) if unavailable
@@ -1027,8 +1043,8 @@ def get_assistnow_blob(token, uniqid_hex, monver_hex, preset, days, gnss,
     """
     now = now or datetime.now(timezone.utc)
     meta_path = cache_path + ".json"
-    data_str = assistnow_data_str(preset, days)
-    attempts = assistnow_data_attempts(preset, days)
+    data_str = assistnow_data_str(preset, days, almanac)
+    attempts = assistnow_data_attempts(preset, days, almanac)
     attempts_key = list(attempts)   # canonical order; `attempts` gets reordered
     meta, known_good, last_fetch_day = {}, None, None
 
@@ -1254,14 +1270,19 @@ def _alm_stale_weeks(msg_id: int, payload: bytes, now: datetime):
 def sanitize_mga_stream(blob: bytes, now: datetime, blob_age_h: float = 0.0,
                         live_max_age_h: float = 4.0,
                         alm_max_stale_weeks: int = 26,
-                        keep_ini: bool = False, label: str = "AssistNow"):
+                        keep_ini: bool = False, keep_almanac: bool = True,
+                        label: str = "AssistNow"):
     """Filter a UBX-MGA stream into something safe to publish.
 
     Dropped: broken frames, UBX-MGA-INI-* (unless keep_ini -- a cached INI-TIME
     is what makes a served file claim the wrong hour), MGA-ANO for days already
     past, live ephemeris older than live_max_age_h (the blob's own age, since
     live orbits expire within hours), and almanac records with an impossible
-    orbit or a week-of-almanac older than alm_max_stale_weeks.
+    orbit or a week-of-almanac older than alm_max_stale_weeks -- or every
+    almanac record, when keep_almanac is false. The request ladder still keeps a
+    rung that asks for the almanac, since it is the only shape the service is
+    known to accept, so dropping it here is what makes the published file lean
+    whichever rung answered.
 
     Returns (clean_bytes, stats) -- stats maps a reason to a dropped count.
     """
@@ -1301,6 +1322,9 @@ def sanitize_mga_stream(blob: bytes, now: datetime, blob_age_h: float = 0.0,
             if mtype == MGA_TYPE_EPH and live_stale:
                 drop("live ephemeris %.1f h old (> %.1f h)"
                      % (blob_age_h, live_max_age_h))
+                continue
+            if mtype == MGA_TYPE_ALM and not keep_almanac:
+                drop("almanac not requested")
                 continue
             if mtype == MGA_TYPE_ALM:
                 sane, val = _alm_sqrta_ok(msg_id, payload)
@@ -1480,6 +1504,13 @@ def main():
                     help="Which aiding to fetch: 'predictive' (multi-day MGA-ANO orbits), "
                          "'live' (current ephemeris for every constellation, best TTFF, "
                          "expires in hours), or 'both' (default; one request).")
+    ap.add_argument("--assistnow-almanac", action="store_true",
+                    help="Also request the almanac (ualm). Off by default: it is "
+                         "coarse orbit data for satellites the predicted orbits "
+                         "already cover, and it was 29%% of the published file. "
+                         "What it alone covered in Europe was one Galileo and "
+                         "four GLONASS satellites, plus BeiDou GEOs and QZSS "
+                         "that never rise here.")
     ap.add_argument("--assistnow-days", type=int, default=3,
                     help="Days of predicted orbits (MGA-ANO) to request, 1-14 "
                          "(default: 3). One day expires at the next UTC midnight, "
@@ -1649,13 +1680,14 @@ def main():
         raw, age_h = get_assistnow_blob(
             args.assistnow_token, args.uniqid, args.monver, args.assistnow_data,
             args.assistnow_days, args.assistnow_gnss, args.assistnow_cache,
-            max_age_h, now, args.assistnow_retry_h)
+            max_age_h, now, args.assistnow_retry_h, args.assistnow_almanac)
         if raw:
             aiding, dropped = sanitize_mga_stream(
                 raw, now, blob_age_h=age_h,
                 live_max_age_h=args.assistnow_live_max_age_h,
                 alm_max_stale_weeks=args.alm_max_stale_weeks,
-                keep_ini=args.keep_assistnow_ini and not args.no_ini)
+                keep_ini=args.keep_assistnow_ini and not args.no_ini,
+                keep_almanac=args.assistnow_almanac)
             for reason, count in sorted(dropped.items()):
                 print(f"  AssistNow: dropped {count} frame(s) — {reason}",
                       file=sys.stderr)

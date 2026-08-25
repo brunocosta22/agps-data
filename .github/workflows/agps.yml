@@ -20,17 +20,19 @@ jobs:
           echo "TS=$(date -u +%Y%m%d_%H%M)" >> $GITHUB_ENV
 
       # 12 h, not hourly: this device profile has been refusing the richer
-      # requests, and predicted orbits plus almanac for the day do not go stale
-      # within the day. The cache is refreshed anyway the moment its MGA-ANO are
+      # requests, and predicted orbits for the day do not go stale within it. The cache is refreshed anyway the moment its MGA-ANO are
       # for a past day, so the midnight rollover is covered without spending the
       # service quota -- which, at one attempt per hour, ran out before
       # mid-morning. What the service accepted is recorded in the cache
       # metadata's 'data_used'.
       #
-      # One file, one URL for the device: AssistNow aiding (almanac for five
-      # constellations, predicted orbits for four, plus ionosphere and health
-      # where the profile allows) followed by this hour's GPS ephemeris from
-      # RINEX. Both halves are sanitised before being written -- the cached
+      # One file, one URL for the device: AssistNow predicted orbits (MGA-ANO
+      # for GPS, Galileo, BeiDou and GLONASS) followed by this hour's GPS
+      # ephemeris and the Klobuchar ionosphere, both from RINEX. The almanac is
+      # neither requested nor published -- coarse orbit data for satellites the
+      # predicted orbits already cover, and 29% of the file. Live ephemeris, the
+      # ionosphere and health are asked for but refused by this profile;
+      # 'data_used' in the cache metadata records what the last fetch got. Both halves are sanitised before being written -- the cached
       # MGA-INI-TIME and any expired MGA-ANO are dropped -- which is what makes
       # a single merged file coherent for a receiver that downloads it hours
       # after it was built.
@@ -83,10 +85,9 @@ jobs:
           <h1>A-GPS Server</h1>
           <p>Last update: ${TS} UTC</p>
           <p><a href="latest.ubx">latest.ubx</a> — u-blox AssistNow aiding
-          (almanac for GPS, Galileo, GLONASS, BeiDou and QZSS; several days of
-          predicted orbits for four of them) plus this hour's GPS broadcast
-          ephemeris and the Klobuchar ionosphere model, both from RINEX, in one
-          UBX-MGA stream.</p>
+          (several days of predicted orbits for GPS, Galileo, GLONASS and
+          BeiDou) plus this hour's GPS broadcast ephemeris and the Klobuchar
+          ionosphere model, both from RINEX, in one UBX-MGA stream.</p>
           <p>The file carries no UBX-MGA-INI-TIME: the receiver supplies its own
           time when it applies the data, so a file downloaded hours after it was
           built is never wrong about the hour.</p>
