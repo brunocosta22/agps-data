@@ -310,6 +310,84 @@ def gps_ephem_to_ubx(rec: dict) -> bytes:
     return make_ubx_frame(UBX_CLASS_MGA, MGA_GPS, payload)
 
 
+# ── RINEX header ionosphere → UBX-MGA-GPS-IONO ──────────────────────────────
+# The Klobuchar coefficients sit in the nav file header we already download, in
+# IONOSPHERIC CORR rows, and the AssistNow profile is not entitled to them
+# ('ukion' counts as a Live component). Off the air GPS repeats them only once
+# per 12.5 min page cycle, so a receiver that fixes and goes back to sleep may
+# never collect them -- which for a single-band receiver means carrying the full
+# ionospheric delay, metres of it, uncorrected.
+#
+# Scale factors are the GPS ICD ones. That is not taken on trust: the values in
+# the header are whole multiples of these LSBs (they are broadcast as 8-bit
+# integers at these scales), so _check_gps_iono_layout rejects a set that does
+# not quantise cleanly -- a wrong scale factor cannot survive that.
+
+_IONO_ALPHA_LSB = (2.0 ** -30, 2.0 ** -27, 2.0 ** -24, 2.0 ** -24)
+_IONO_BETA_LSB = (2.0 ** 11, 2.0 ** 14, 2.0 ** 16, 2.0 ** 16)
+MGA_TYPE_IONO = 0x06
+
+
+def parse_iono_klobuchar(text: str):
+    """(alpha[4], beta[4]) from the GPSA/GPSB header rows, or None if absent.
+
+    RINEX 3 lays the row out as A4,1X,4D12.4, and a concatenation of hourly
+    station files has one header per station -- the first complete pair wins,
+    they are a system-wide broadcast and identical between stations.
+    """
+    alpha = beta = None
+    for line in text.splitlines():
+        if "IONOSPHERIC CORR" not in line:
+            continue
+        tag = line[:4].strip()
+        if tag not in ("GPSA", "GPSB"):
+            continue
+        vals = [_f(line[5 + i * 12:17 + i * 12]) for i in range(4)]
+        if tag == "GPSA" and alpha is None:
+            alpha = vals
+        elif tag == "GPSB" and beta is None:
+            beta = vals
+        if alpha and beta:
+            return alpha, beta
+    return None
+
+
+def _check_gps_iono_layout(payload: bytes, alpha, beta) -> None:
+    """Raise ValueError unless the packed coefficients read back as the values
+    that went in, at the offsets the message specifies."""
+    if len(payload) != 16:
+        raise ValueError("payload is %d bytes, expected 16" % len(payload))
+    if payload[0] != MGA_TYPE_IONO or payload[1] != 0x00:
+        raise ValueError("type/version = %02X/%02X, expected 06/00"
+                         % (payload[0], payload[1]))
+    got = struct.unpack_from("<8b", payload, 4)
+    for name, want, raw, lsb in zip(
+            ("a0", "a1", "a2", "a3", "b0", "b1", "b2", "b3"),
+            list(alpha) + list(beta), got, _IONO_ALPHA_LSB + _IONO_BETA_LSB):
+        # The header prints 5 significant digits, so allow a hundredth of an LSB
+        # of formatting slack -- but no more: anything larger means the scale
+        # factor is wrong, since these are 8-bit broadcast values.
+        if abs(want / lsb - raw) > 0.01:
+            raise ValueError("%s = %g is %.3f LSB, not the integer %d -- wrong "
+                             "scale factor?" % (name, want, want / lsb, raw))
+
+
+def make_mga_gps_iono(alpha, beta) -> bytes:
+    """UBX-MGA-GPS-IONO (16-byte payload): the Klobuchar ionosphere model."""
+    coeffs = [_clamp(v / lsb, -128, 127) for v, lsb in
+              zip(list(alpha) + list(beta), _IONO_ALPHA_LSB + _IONO_BETA_LSB)]
+    payload = struct.pack(
+        "<BBH8bI",
+        MGA_TYPE_IONO,   # U1  type = IONO
+        0x00,            # U1  version
+        0,               # U2  reserved1
+        *coeffs,         # I1  alpha0..3, beta0..3
+        0,               # U4  reserved2
+    )
+    _check_gps_iono_layout(payload, alpha, beta)
+    return make_ubx_frame(UBX_CLASS_MGA, MGA_GPS, payload)
+
+
 # ── RINEX 3 download ─────────────────────────────────────────────────────────
 
 def _doy(dt: datetime) -> int:
@@ -412,7 +490,8 @@ def download_rinex_hourly(now: datetime, max_age_h: float = 4.0,
                           min_prns: int = 30, max_back: int = 4,
                           max_stations: int = 12) -> tuple:
     """Download hourly broadcast nav until min_prns GPS PRNs have an ephemeris
-    younger than max_age_h. Returns (records, reference_datetime) or (None, None).
+    younger than max_age_h. Returns (records, reference_datetime, iono) or
+    (None, None, None); iono is the (alpha, beta) Klobuchar pair from the header.
 
     The stop criterion counts *fresh* PRNs, not PRNs present: every station also
     holds the last ephemeris it heard from satellites long out of view, so
@@ -433,7 +512,7 @@ def download_rinex_hourly(now: datetime, max_age_h: float = 4.0,
                   "built-in station list", file=sys.stderr)
             stations = HOURLY_STATIONS_FALLBACK
         order = _order_stations_for_spread(stations)[:max_stations]
-        records, fresh_prns = [], set()
+        records, fresh_prns, iono = [], set(), None
         for st in order:
             url = (f"{_BKG_NRT}/{doy:03d}/{hh:02d}/"
                    f"{st}_R_{year:04d}{doy:03d}{hh:02d}00_01H_MN.rnx.gz")
@@ -444,8 +523,10 @@ def download_rinex_hourly(now: datetime, max_age_h: float = 4.0,
                 continue
             if raw[:2] == b"\x1f\x8b":
                 raw = gzip.decompress(raw)
-            recs = parse_gps_nav(raw.decode("ascii", errors="replace"))
+            text = raw.decode("ascii", errors="replace")
+            recs = parse_gps_nav(text)
             records += recs
+            iono = iono or parse_iono_klobuchar(text)
             fresh_prns |= {r["prn"] for r in recs
                            if _record_age_h(r, now_sow) <= max_age_h}
             print(f"  hourly {st} {doy:03d}/{hh:02d}h OK — {len(fresh_prns)} PRNs "
@@ -456,8 +537,8 @@ def download_rinex_hourly(now: datetime, max_age_h: float = 4.0,
             print(f"Hourly ephemeris @ {doy:03d}/{hh:02d}h UTC: {len(records)} "
                   f"records, {len(fresh_prns)} PRNs fresher than {max_age_h} h",
                   file=sys.stderr)
-            return records, t
-    return None, None
+            return records, t, iono
+    return None, None, None
 
 
 # ── RINEX 3 GPS navigation parser ────────────────────────────────────────────
@@ -846,6 +927,32 @@ def fetch_ztp_credentials(token, uniqid_hex, monver_hex):
 _ASSISTNOW_DOWNGRADE_CODES = (400, 401, 403, 404, 422)
 
 
+def filter_data_strs(data_strs, allowed):
+    """Drop request components the device profile is not entitled to.
+
+    The credentials call answers with allowedData, a comma-separated list of the
+    components this profile may ask for, e.g.
+    'ualm, uporb_1, uporb_3, uporb_7, uporb_14'. Filtering the ladder against it
+    is what makes 'uporb_3,ualm' get asked for at all: the service rejects a
+    request carrying any Live component -- the ionosphere and satellite health
+    count as Live, not just the orbits -- and the hand-written ladder only ever
+    paired the extra days with the ionosphere. Three days of predicted orbits
+    therefore looked unavailable while allowedData plainly offered fourteen.
+
+    Falls back to the unfiltered ladder if allowedData is empty or filters
+    everything away, so an unexpected format cannot make the fetch impossible.
+    """
+    tokens = {t.strip() for t in (allowed or "").split(",") if t.strip()}
+    if not tokens:
+        return data_strs
+    out = []
+    for spec in data_strs:
+        kept = ",".join(c for c in spec.split(",") if c.strip() in tokens)
+        if kept and kept not in out:
+            out.append(kept)
+    return out or data_strs
+
+
 def fetch_assistnow_mga(token, uniqid_hex, monver_hex, data_strs, gnss):
     """Full ZTP AssistNow fetch (credentials -> data). Returns (raw UBX-MGA
     bytes, the 'data=' string that worked, the profile's allowedData) or raises
@@ -864,6 +971,12 @@ def fetch_assistnow_mga(token, uniqid_hex, monver_hex, data_strs, gnss):
     except (urllib.error.URLError, ValueError, RuntimeError) as exc:
         raise RuntimeError(f"ZTP credentials failed: {exc}")
     print(f"AssistNow ZTP: chipcode obtained (allowedData: {allowed})", file=sys.stderr)
+
+    entitled = filter_data_strs(data_strs, allowed)
+    if entitled != data_strs:
+        print(f"AssistNow: asking only for what the profile allows: "
+              f"{entitled}", file=sys.stderr)
+        data_strs = entitled
 
     last_err = "no data string tried"
     for data_str in data_strs:
@@ -1310,6 +1423,14 @@ def main():
                     help="Ephemeris source: 'hourly' = freshest (<1 h, best hot "
                          "start), 'daily' = whole-day file, 'auto' (default) = "
                          "hourly, topped up from the daily file if coverage is thin")
+    ap.add_argument("--no-iono", action="store_true",
+                    help="Do not emit the UBX-MGA-GPS-IONO frame built from the "
+                         "RINEX header's Klobuchar coefficients. They are worth "
+                         "having (the AssistNow profile will not serve them and "
+                         "the air takes up to 12.5 min), but the byte layout of "
+                         "that message has not been cross-checked against real "
+                         "service output the way the ephemeris has -- so this "
+                         "turns it off if the receiver NAKs it.")
     ap.add_argument("--min-prns", type=int, default=30,
                     help="Keep pulling hourly stations (then the daily file) until "
                          "this many GPS PRNs are covered (default: 30)")
@@ -1406,6 +1527,7 @@ def main():
     args = ap.parse_args()
 
     now = datetime.now(timezone.utc)
+    iono = None
 
     # ── Verify-only mode: inspect a file someone else produced ───────────────
     if args.verify:
@@ -1420,8 +1542,8 @@ def main():
     # 1. Hourly source first (freshest → best hot start), unless the user forced
     #    a daily source or a specific past --date.
     if args.source in ("auto", "hourly") and not args.date:
-        hourly, _ = download_rinex_hourly(now, max_age_h=args.max_age_h,
-                                          min_prns=args.min_prns)
+        hourly, _, iono = download_rinex_hourly(now, max_age_h=args.max_age_h,
+                                                min_prns=args.min_prns)
         if hourly:
             all_records = hourly
 
@@ -1453,6 +1575,7 @@ def main():
             except RuntimeError:
                 pass
         if text:
+            iono = iono or parse_iono_klobuchar(text)
             daily = parse_gps_nav(text)
             print(f"Parsed {len(daily)} GPS records from daily data", file=sys.stderr)
             all_records += daily
@@ -1486,7 +1609,20 @@ def main():
             frames.append(make_mga_ini_pos_llh(*pos))
             print(f"Position injected: lat={pos[0]} lon={pos[1]} alt={pos[2]} m", file=sys.stderr)
 
-    # 3. GPS ephemeris frames
+    # 3. Ionosphere model, if the RINEX header carried one. AssistNow will not
+    #    serve it on this profile, and off the air it takes up to 12.5 min.
+    if iono and not args.no_iono:
+        try:
+            frames.append(make_mga_gps_iono(*iono))
+            print(f"Ionosphere (Klobuchar) from the RINEX header: "
+                  f"alpha={iono[0]} beta={iono[1]}", file=sys.stderr)
+        except ValueError as exc:
+            print(f"  ionosphere rejected — {exc}", file=sys.stderr)
+    elif not iono:
+        print("No IONOSPHERIC CORR in the RINEX header — no ionosphere model",
+              file=sys.stderr)
+
+    # 4. GPS ephemeris frames
     conversion_errors = 0
     for rec in fresh:
         try:
