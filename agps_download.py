@@ -848,7 +848,8 @@ _ASSISTNOW_DOWNGRADE_CODES = (400, 401, 403, 404, 422)
 
 def fetch_assistnow_mga(token, uniqid_hex, monver_hex, data_strs, gnss):
     """Full ZTP AssistNow fetch (credentials -> data). Returns (raw UBX-MGA
-    bytes, the 'data=' string that worked) or raises RuntimeError. Consumes
+    bytes, the 'data=' string that worked, the profile's allowedData) or raises
+    RuntimeError. Consumes
     service quota -- call only via get_assistnow_blob() so the cache gates it.
     The credentials are fetched once and reused across the data-string
     fallbacks, so a downgraded request costs no extra credentials call."""
@@ -886,7 +887,7 @@ def fetch_assistnow_mga(token, uniqid_hex, monver_hex, data_strs, gnss):
                             f"{data[:80]!r}")
             else:
                 print(f"  OK -- {len(data)} bytes of UBX-MGA", file=sys.stderr)
-                return data, data_str
+                return data, data_str, allowed
         print(f"  rejected ({last_err}) -- trying a smaller request",
               file=sys.stderr)
     raise RuntimeError(f"AssistNow data failed: {last_err}")
@@ -986,7 +987,7 @@ def get_assistnow_blob(token, uniqid_hex, monver_hex, preset, days, gnss,
               f"({known_good})", file=sys.stderr)
 
     try:
-        data, data_used = fetch_assistnow_mga(
+        data, data_used, allowed = fetch_assistnow_mga(
             token, uniqid_hex, monver_hex, attempts, gnss)
     except RuntimeError as exc:
         # Record the failed attempt so the next run backs off instead of walking
@@ -1018,6 +1019,7 @@ def get_assistnow_blob(token, uniqid_hex, monver_hex, preset, days, gnss,
             "data": data_str,
             "data_used": data_used,
             "attempts": attempts_key,
+            "allowed_data": allowed,
             "gnss": gnss,
             "bytes": len(data),
         }, f)
