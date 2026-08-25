@@ -1270,19 +1270,19 @@ def _alm_stale_weeks(msg_id: int, payload: bytes, now: datetime):
 def sanitize_mga_stream(blob: bytes, now: datetime, blob_age_h: float = 0.0,
                         live_max_age_h: float = 4.0,
                         alm_max_stale_weeks: int = 26,
-                        keep_ini: bool = False, keep_almanac: bool = True,
-                        label: str = "AssistNow"):
+                        keep_ini: bool = False, label: str = "AssistNow"):
     """Filter a UBX-MGA stream into something safe to publish.
 
     Dropped: broken frames, UBX-MGA-INI-* (unless keep_ini -- a cached INI-TIME
     is what makes a served file claim the wrong hour), MGA-ANO for days already
     past, live ephemeris older than live_max_age_h (the blob's own age, since
     live orbits expire within hours), and almanac records with an impossible
-    orbit or a week-of-almanac older than alm_max_stale_weeks -- or every
-    almanac record, when keep_almanac is false. The request ladder still keeps a
-    rung that asks for the almanac, since it is the only shape the service is
-    known to accept, so dropping it here is what makes the published file lean
-    whichever rung answered.
+    orbit or a week-of-almanac older than alm_max_stale_weeks.
+
+    Almanac records that are simply not asked for any more are *not* dropped:
+    once they are in the cache they cost no further quota, so discarding them
+    would throw away aiding already paid for. The published file stops carrying
+    them by itself, as soon as a fetch that does not ask for them succeeds.
 
     Returns (clean_bytes, stats) -- stats maps a reason to a dropped count.
     """
@@ -1322,9 +1322,6 @@ def sanitize_mga_stream(blob: bytes, now: datetime, blob_age_h: float = 0.0,
             if mtype == MGA_TYPE_EPH and live_stale:
                 drop("live ephemeris %.1f h old (> %.1f h)"
                      % (blob_age_h, live_max_age_h))
-                continue
-            if mtype == MGA_TYPE_ALM and not keep_almanac:
-                drop("almanac not requested")
                 continue
             if mtype == MGA_TYPE_ALM:
                 sane, val = _alm_sqrta_ok(msg_id, payload)
@@ -1510,7 +1507,9 @@ def main():
                          "already cover, and it was 29%% of the published file. "
                          "What it alone covered in Europe was one Galileo and "
                          "four GLONASS satellites, plus BeiDou GEOs and QZSS "
-                         "that never rise here.")
+                         "that never rise here. This governs the request only -- "
+                         "almanac records already in the cache keep being "
+                         "published, since they cost no further quota.")
     ap.add_argument("--assistnow-days", type=int, default=3,
                     help="Days of predicted orbits (MGA-ANO) to request, 1-14 "
                          "(default: 3). One day expires at the next UTC midnight, "
@@ -1686,8 +1685,7 @@ def main():
                 raw, now, blob_age_h=age_h,
                 live_max_age_h=args.assistnow_live_max_age_h,
                 alm_max_stale_weeks=args.alm_max_stale_weeks,
-                keep_ini=args.keep_assistnow_ini and not args.no_ini,
-                keep_almanac=args.assistnow_almanac)
+                keep_ini=args.keep_assistnow_ini and not args.no_ini)
             for reason, count in sorted(dropped.items()):
                 print(f"  AssistNow: dropped {count} frame(s) — {reason}",
                       file=sys.stderr)
