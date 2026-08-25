@@ -1,16 +1,12 @@
 <html>
 <body>
 <h1>A-GPS Server</h1>
-<p>Last update: 20260825_0949 UTC</p>
-<ul>
-  <li><a href="latest.ubx">latest.ubx</a> — u-blox AssistNow: almanac,
-      ionosphere, predicted orbits (3 days) and live ephemeris for
-      GPS, Galileo, GLONASS, BeiDou and QZSS. Use this one.</li>
-  <li><a href="latest_rinex.ubx">latest_rinex.ubx</a> — free RINEX
-      broadcast ephemeris, GPS only, refreshed hourly. Fallback that
-      needs no service token.</li>
-</ul>
-<p>Neither file carries UBX-MGA-INI-TIME: the receiver supplies its own
+<p>Last update: 20260825_1047 UTC</p>
+<p><a href="latest.ubx">latest.ubx</a> — u-blox AssistNow aiding
+(almanac for GPS, Galileo, GLONASS, BeiDou and QZSS; predicted orbits
+for four of them) plus this hour's GPS broadcast ephemeris from
+RINEX, in one UBX-MGA stream.</p>
+<p>The file carries no UBX-MGA-INI-TIME: the receiver supplies its own
 time when it applies the data, so a file downloaded hours after it was
 built is never wrong about the hour.</p>
 </body>
