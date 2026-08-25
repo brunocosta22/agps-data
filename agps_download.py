@@ -893,84 +893,122 @@ def fetch_assistnow_mga(token, uniqid_hex, monver_hex, data_strs, gnss):
 
 
 def get_assistnow_blob(token, uniqid_hex, monver_hex, preset, days, gnss,
-                       cache_path, max_age_h, now=None):
+                       cache_path, max_age_h, now=None, retry_h=3.0):
     """Return (blob, age_h) for the AssistNow MGA data, reusing a cached copy
-    while it is still worth serving so the service quota is respected even when
-    this script runs hourly. Persist cache_path (+ '.json') between runs (a
-    committed file or actions/cache). Returns (b'', 0.0) if unavailable (never
-    fatal).
+    while it is still worth serving. Persist cache_path (+ '.json') between runs
+    (a committed file or actions/cache). Returns (b'', 0.0) if unavailable
+    (never fatal).
 
-    Besides max_age_h, a cache entry is rejected once its predicted orbits are
-    for a day already past: an age limit cannot see midnight go by, so a 12 h
-    window happily served yesterday's offline data all morning. age_h is
-    returned so the caller can drop live ephemeris that has since expired.
+    Three gates keep the service quota intact, and each exists because of a way
+    the previous one failed:
+      * max_age_h -- do not fetch what is still good;
+      * the predicted-orbit day -- an age limit cannot see midnight go by, so a
+        12 h window happily served yesterday's offline data all morning;
+      * retry_h after a refusal -- without it a rejection was retried on every
+        hourly run, and since each attempt walks a ladder of up to four
+        requests, ten attempts a day exhausted what the service was willing to
+        serve before mid-morning.
+
+    age_h is returned so the caller can drop live ephemeris that has expired.
     """
     now = now or datetime.now(timezone.utc)
     meta_path = cache_path + ".json"
     data_str = assistnow_data_str(preset, days)
     attempts = assistnow_data_attempts(preset, days)
-    cached_age, known_good, last_fetch_day = None, None, None
+    attempts_key = list(attempts)   # canonical order; `attempts` gets reordered
+    meta, known_good, last_fetch_day = {}, None, None
 
-    # Reuse a fresh cache without spending a request.
+    def age_h(iso):
+        try:
+            return (now - datetime.fromisoformat(iso)).total_seconds() / 3600.0
+        except (TypeError, ValueError):
+            return None
+
+    def read_cache():
+        try:
+            with open(cache_path, "rb") as f:
+                return f.read()
+        except OSError:
+            return b""
+
     try:
         with open(meta_path) as f:
             meta = json.load(f)
-        fetched = datetime.fromisoformat(meta["fetched_utc"])
-        cached_age = (now - fetched).total_seconds() / 3600.0
-        params_match = (meta.get("data") == data_str and meta.get("gnss") == gnss)
-        # Lead with the remembered request only if the chain that produced it is
-        # the chain being used now. Comparing just the preferred request is not
-        # enough: widening the middle of the chain leaves the first entry
-        # untouched, so the new variants would never actually be tried until the
-        # next UTC day rolled over.
-        if params_match and meta.get("attempts") == attempts:
-            known_good, last_fetch_day = meta.get("data_used"), fetched.date()
-        if params_match and cached_age < max_age_h:
-            with open(cache_path, "rb") as f:
-                data = f.read()
-            ano_day = ano_latest_day(data)
-            if "uporb" in meta.get("data_used", data_str) and (
-                    ano_day is None or ano_day < now.date()):
-                print(f"AssistNow: cache predicted orbits expired "
-                      f"(latest MGA-ANO day {ano_day}) -- refreshing",
-                      file=sys.stderr)
-            else:
-                print(f"AssistNow: cache hit ({cached_age:.1f} h old, "
-                      f"{len(data)} bytes) -- not calling the service",
-                      file=sys.stderr)
-                return data, cached_age
-        else:
-            print(f"AssistNow: cache stale ({cached_age:.1f} h >= {max_age_h} h) "
-                  "or params changed -- refreshing", file=sys.stderr)
-    except (FileNotFoundError, KeyError, ValueError) as exc:
-        print(f"AssistNow: no usable cache ({exc}) -- fetching", file=sys.stderr)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"AssistNow: no usable cache metadata ({exc})", file=sys.stderr)
 
-    # Cache miss / stale: spend one quota request. Lead with whatever the
-    # service accepted last time, unless this is the first fetch of a new UTC
-    # day -- then the full request is worth one more try, so an entitlement that
-    # has since been upgraded is picked up without anyone editing this file.
+    cached_age = age_h(meta.get("fetched_utc"))
+    params_match = (meta.get("data") == data_str and meta.get("gnss") == gnss)
+    # Lead with the remembered request only if the chain that produced it is the
+    # chain in use now. Comparing just the preferred request is not enough:
+    # widening the middle of the ladder leaves its first entry untouched, so the
+    # new variants would never be tried until the next UTC day rolled over.
+    if params_match and cached_age is not None and meta.get("attempts") == attempts_key:
+        known_good = meta.get("data_used")
+        last_fetch_day = (now - timedelta(hours=cached_age)).date()
+
+    # 1. A cache still worth serving costs no request at all.
+    if params_match and cached_age is not None and cached_age < max_age_h:
+        data = read_cache()
+        ano_day = ano_latest_day(data) if data else None
+        if not data:
+            print("AssistNow: metadata without a cache file -- fetching",
+                  file=sys.stderr)
+        elif "uporb" in meta.get("data_used", data_str) and (
+                ano_day is None or ano_day < now.date()):
+            print(f"AssistNow: cache predicted orbits expired (latest MGA-ANO "
+                  f"day {ano_day}) -- refreshing", file=sys.stderr)
+        else:
+            print(f"AssistNow: cache hit ({cached_age:.1f} h old, {len(data)} "
+                  f"bytes) -- not calling the service", file=sys.stderr)
+            return data, cached_age
+
+    # 2. Back off after a refusal, as long as there is something to serve.
+    stale = read_cache()
+    failed_age = age_h(meta.get("last_attempt_utc"))
+    if stale and failed_age is not None and failed_age < retry_h:
+        age = cached_age if cached_age is not None else 1e6
+        print(f"AssistNow: last attempt failed {failed_age:.1f} h ago "
+              f"(< {retry_h} h) -- serving the cached blob rather than spending "
+              f"another request", file=sys.stderr)
+        return stale, age
+
+    # 3. Spend the quota. Lead with whatever the service accepted last time,
+    #    except on the first fetch of a new UTC day -- then the full request is
+    #    worth one more try, so an entitlement that has since been upgraded is
+    #    picked up without anyone editing this file.
+    print(f"AssistNow: refreshing (cache "
+          f"{'%.1f h old' % cached_age if cached_age is not None else 'absent'})",
+          file=sys.stderr)
     if known_good in attempts and last_fetch_day == now.date():
         attempts = [known_good] + [a for a in attempts if a != known_good]
         print(f"AssistNow: leading with the last accepted request "
               f"({known_good})", file=sys.stderr)
+
     try:
         data, data_used = fetch_assistnow_mga(
             token, uniqid_hex, monver_hex, attempts, gnss)
     except RuntimeError as exc:
-        # Fall back to a stale cache if present -- old aiding beats none, and the
-        # hourly live publish must never break on an AssistNow hiccup. The age
-        # goes back to the caller so expired parts of it are dropped.
+        # Record the failed attempt so the next run backs off instead of walking
+        # the ladder again, then fall back to a stale cache if there is one --
+        # old aiding beats none, and the hourly publish must never break on an
+        # AssistNow hiccup. The age goes back to the caller so expired parts of
+        # it are dropped.
+        meta["last_attempt_utc"] = now.isoformat()
         try:
-            with open(cache_path, "rb") as f:
-                data = f.read()
+            with open(meta_path, "w") as f:
+                json.dump(meta, f)
+        except OSError as werr:
+            print(f"AssistNow: could not record the failed attempt ({werr})",
+                  file=sys.stderr)
+        if stale:
             age = cached_age if cached_age is not None else 1e6
             print(f"AssistNow: fetch failed, reusing stale cache "
-                  f"({len(data)} bytes, {age:.1f} h old): {exc}", file=sys.stderr)
-            return data, age
-        except FileNotFoundError:
-            print(f"AssistNow: fetch failed and no cache -- live-only this run: "
-                  f"{exc}", file=sys.stderr)
-            return b"", 0.0
+                  f"({len(stale)} bytes, {age:.1f} h old): {exc}", file=sys.stderr)
+            return stale, age
+        print(f"AssistNow: fetch failed and no cache -- live-only this run: "
+              f"{exc}", file=sys.stderr)
+        return b"", 0.0
 
     with open(cache_path, "wb") as f:
         f.write(data)
@@ -979,7 +1017,7 @@ def get_assistnow_blob(token, uniqid_hex, monver_hex, preset, days, gnss,
             "fetched_utc": now.isoformat(),
             "data": data_str,
             "data_used": data_used,
-            "attempts": attempts,
+            "attempts": attempts_key,
             "gnss": gnss,
             "bytes": len(data),
         }, f)
@@ -1353,6 +1391,11 @@ def main():
                     help="Where to persist the AssistNow blob between runs (default: "
                          "agps_assistnow_cache.ubx). Persist this file AND its '.json' "
                          "sidecar across CI runs so the service quota is respected.")
+    ap.add_argument("--assistnow-retry-h", type=float, default=3.0,
+                    help="After the service refuses a request, wait this long "
+                         "before spending another one (default: 3 h). Retrying "
+                         "on every hourly run is what emptied the daily quota "
+                         "by mid-morning.")
     ap.add_argument("--assistnow-max-age-h", type=float, default=None,
                     help="Only re-fetch when the cache is older than this. Default depends "
                          "on --assistnow-data: 12 h for 'predictive', 1 h for 'live'/'both' "
@@ -1468,7 +1511,7 @@ def main():
         raw, age_h = get_assistnow_blob(
             args.assistnow_token, args.uniqid, args.monver, args.assistnow_data,
             args.assistnow_days, args.assistnow_gnss, args.assistnow_cache,
-            max_age_h, now)
+            max_age_h, now, args.assistnow_retry_h)
         if raw:
             aiding, dropped = sanitize_mga_stream(
                 raw, now, blob_age_h=age_h,
