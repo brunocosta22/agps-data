@@ -918,7 +918,12 @@ def get_assistnow_blob(token, uniqid_hex, monver_hex, preset, days, gnss,
         fetched = datetime.fromisoformat(meta["fetched_utc"])
         cached_age = (now - fetched).total_seconds() / 3600.0
         params_match = (meta.get("data") == data_str and meta.get("gnss") == gnss)
-        if params_match:
+        # Lead with the remembered request only if the chain that produced it is
+        # the chain being used now. Comparing just the preferred request is not
+        # enough: widening the middle of the chain leaves the first entry
+        # untouched, so the new variants would never actually be tried until the
+        # next UTC day rolled over.
+        if params_match and meta.get("attempts") == attempts:
             known_good, last_fetch_day = meta.get("data_used"), fetched.date()
         if params_match and cached_age < max_age_h:
             with open(cache_path, "rb") as f:
@@ -974,6 +979,7 @@ def get_assistnow_blob(token, uniqid_hex, monver_hex, preset, days, gnss,
             "fetched_utc": now.isoformat(),
             "data": data_str,
             "data_used": data_used,
+            "attempts": attempts,
             "gnss": gnss,
             "bytes": len(data),
         }, f)
