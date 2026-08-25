@@ -954,6 +954,12 @@ def filter_data_strs(data_strs, allowed):
     paired the extra days with the ionosphere. Three days of predicted orbits
     therefore looked unavailable while allowedData plainly offered fourteen.
 
+    Rungs that differ only in the day count are then dropped, once allowedData
+    has confirmed the preferred count: they test a hypothesis that has already
+    been answered, and a refusal of an entitled request is a quota or a server
+    problem, not something a smaller day count fixes. That is what keeps a
+    quota refusal down to two requests instead of four.
+
     Falls back to the unfiltered ladder if allowedData is empty or filters
     everything away, so an unexpected format cannot make the fetch impossible.
     """
@@ -965,7 +971,16 @@ def filter_data_strs(data_strs, allowed):
         kept = ",".join(c for c in spec.split(",") if c.strip() in tokens)
         if kept and kept not in out:
             out.append(kept)
-    return out or data_strs
+    if not out:
+        return data_strs
+
+    def porb_of(spec):
+        return next((c for c in spec.split(",") if c.startswith("uporb_")), None)
+
+    want = porb_of(out[0])
+    if want in tokens:
+        out = [s for s in out if porb_of(s) in (want, None)]
+    return out
 
 
 def fetch_assistnow_mga(token, uniqid_hex, monver_hex, data_strs, gnss):
@@ -1094,14 +1109,30 @@ def get_assistnow_blob(token, uniqid_hex, monver_hex, preset, days, gnss,
             return data, cached_age
 
     # 2. Back off after a refusal, as long as there is something to serve.
+    #    The daily quota resets at midnight UTC, so once a fetch has failed
+    #    today there is nothing to gain from trying again before then -- provided
+    #    the cached predicted orbits still cover today. If they do not, the run
+    #    has no useful aiding to serve and the shorter retry_h applies instead:
+    #    a stale-by-a-day cache is worth gambling a request on, a good one is
+    #    not.
     stale = read_cache()
     failed_age = age_h(meta.get("last_attempt_utc"))
-    if stale and failed_age is not None and failed_age < retry_h:
+    if stale and failed_age is not None:
         age = cached_age if cached_age is not None else 1e6
-        print(f"AssistNow: last attempt failed {failed_age:.1f} h ago "
-              f"(< {retry_h} h) -- serving the cached blob rather than spending "
-              f"another request", file=sys.stderr)
-        return stale, age
+        failed_day = (now - timedelta(hours=failed_age)).date()
+        ano_day = ano_latest_day(stale)
+        covers_today = ano_day is not None and ano_day >= now.date()
+        if failed_day == now.date() and covers_today:
+            print(f"AssistNow: a fetch already failed today "
+                  f"({failed_age:.1f} h ago) and the cached predicted orbits "
+                  f"still cover {ano_day} -- no further request until the quota "
+                  f"resets at midnight UTC", file=sys.stderr)
+            return stale, age
+        if failed_age < retry_h:
+            print(f"AssistNow: last attempt failed {failed_age:.1f} h ago "
+                  f"(< {retry_h} h) -- serving the cached blob rather than "
+                  f"spending another request", file=sys.stderr)
+            return stale, age
 
     # 3. Spend the quota. Lead with whatever the service accepted last time,
     #    except on the first fetch of a new UTC day -- then the full request is
