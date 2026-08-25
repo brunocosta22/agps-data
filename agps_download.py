@@ -2,24 +2,24 @@
 """
 Free AGPS data generator for u-blox M10.
 
-Two independent sources of aiding, deliberately published as two files:
+Two independent sources of aiding, merged into one file:
 
-  * live RINEX ephemeris (--output): today's broadcast navigation data from
-    BKG/IGS hourly stations, no registration and no token, converted to
-    UBX-MGA-GPS-EPH. GPS only.
-  * AssistNow (--assistnow-output): the u-blox service reached through a
-    Thingstream ZTP token, carrying almanac, ionosphere, predicted orbits
-    (MGA-ANO) and -- with --assistnow-data live/both -- live ephemeris for
-    every constellation.
+  * live RINEX ephemeris: today's broadcast navigation data from BKG/IGS
+    hourly stations, no registration and no token, converted to
+    UBX-MGA-GPS-EPH. GPS only, precise, valid for its ~4 h fit interval.
+  * AssistNow: the u-blox service reached through a Thingstream ZTP token,
+    carrying almanac, predicted orbits (MGA-ANO) for four constellations,
+    and -- where the device profile allows it -- the ionosphere model,
+    satellite health and live ephemeris.
 
-They are kept apart on purpose. The AssistNow blob is served from a cache and
-carries its own timestamps and expiry dates, the RINEX blob is built now; merged
-into one file a receiver cannot tell which half is which, and a stale INI-TIME
-from the cached half told it the wrong hour entirely. Everything written out is
-walked frame by frame first (see sanitize_mga_stream / describe_ubx): expired
-predicted orbits, cached INI-TIME, live ephemeris past its fit interval and
-almanac records with impossible orbits are dropped, and a structurally broken
-blob is not written at all so the previous good file keeps being served.
+Both go through sanitize_mga_stream() before they are written, which is what
+makes one file safe: the AssistNow half is served from a cache and carries its
+own timestamps and expiry dates, so its MGA-INI-TIME (the time of the fetch, not
+of the download) and any MGA-ANO for a day already past are dropped, along with
+live ephemeris past its fit interval and almanac records with impossible orbits.
+A structurally broken blob is not written at all, so the previous good file keeps
+being served. --assistnow-output writes the AssistNow half to its own file
+instead, for anyone who wants the two sources served separately.
 
 Sources (tried in order, all free):
   - BKG hourly NRT:  https://igs.bkg.bund.de/root_ftp/IGS/nrt/{doy}/{hh}/
@@ -30,10 +30,10 @@ Usage:
     python3 agps_download.py [--output agps.ubx] [--date YYYY-MM-DD]
                              [--max-age-h 4] [--stats]
 
-    # Server mode: the two files published at a stable URL (see
+    # Server mode: the single file published at a stable URL (see
     # .github/workflows/agps.yml for the full hourly invocation)
     python3 agps_download.py --no-ini --assistnow-data both
-        --output docs/latest_rinex.ubx --assistnow-output docs/latest.ubx
+        --output docs/latest.ubx --assistnow-cache docs/agps_assistnow_cache.ubx
 
     # Check a file someone else produced (frame inventory + field alignment)
     python3 agps_download.py --verify docs/latest.ubx
@@ -1478,14 +1478,22 @@ def main():
         print("No AssistNow token (--assistnow-token / ASSISTNOW_TOKEN) -- live-only "
               "output", file=sys.stderr)
 
-    # Two files or one: kept apart, each file has a single source and a single
-    # lifetime; merged, a receiver cannot tell which half is which.
+    # One file by default: the device fetches a single URL, and this way it gets
+    # the predicted orbits for four constellations and the fresh GPS ephemeris
+    # in one download. Merging is only safe because both halves went through the
+    # sanitiser first -- what used to make the combined blob incoherent was the
+    # cached INI-TIME and the expired MGA-ANO riding along, not the merge.
+    # --assistnow-output splits them again for anyone who wants that.
+    #
+    # Aiding first, ephemeris last: they land in different stores in the
+    # receiver so the order does not matter, but if anything ever does prefer
+    # the later frame, the precise broadcast ephemeris is the one to win.
     if aiding and not args.assistnow_output:
-        binary += aiding
-        print(f"Merged AssistNow aiding into {args.output}; blob now "
-              f"{len(binary)} bytes", file=sys.stderr)
+        binary = aiding + binary
+        print(f"Merged {len(aiding)} bytes of AssistNow aiding into "
+              f"{args.output}; blob now {len(binary)} bytes", file=sys.stderr)
 
-    problems = report_blob(f"Live RINEX blob ({args.output})", binary, now,
+    problems = report_blob(f"Blob for {args.output}", binary, now,
                            served=args.no_ini)
     if args.stats:
         for line in describe_ubx(binary, now, served=args.no_ini)[0]:

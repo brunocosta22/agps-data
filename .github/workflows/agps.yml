@@ -19,38 +19,33 @@ jobs:
         run: |
           echo "TS=$(date -u +%Y%m%d_%H%M)" >> $GITHUB_ENV
 
-      # 12 h, not hourly: this device profile is only entitled to
-      # 'uporb_1,ualm' (the richer requests come back rejected), and predicted
-      # orbits plus almanac for the day do not go stale within the day. The
-      # cache is refreshed anyway the moment its MGA-ANO are for a past day, so
-      # the midnight rollover is covered without spending the service quota --
-      # which, at one attempt per hour, ran out before mid-morning.
+      # 12 h, not hourly: this device profile has been refusing the richer
+      # requests, and predicted orbits plus almanac for the day do not go stale
+      # within the day. The cache is refreshed anyway the moment its MGA-ANO are
+      # for a past day, so the midnight rollover is covered without spending the
+      # service quota -- which, at one attempt per hour, ran out before
+      # mid-morning. What the service accepted is recorded in the cache
+      # metadata's 'data_used'.
       #
-      # Two files, one run, one AssistNow request:
-      #   latest.ubx        u-blox AssistNow: almanac for all five
-      #                     constellations + predicted orbits (MGA-ANO), and
-      #                     the ionosphere model and satellite health when the
-      #                     profile serves them. Live ephemeris is asked for
-      #                     too; this profile has been refusing it, and the
-      #                     'data_used' field of the cache metadata records
-      #                     what it accepted on the last fetch.
-      #   latest_rinex.ubx  free RINEX broadcast ephemeris, GPS only, hourly
-      # Kept apart because their contents expire on completely different
-      # timescales; merged, the served blob looked internally inconsistent
-      # (a cached INI-TIME from one half dating the other half's ephemeris).
+      # One file, one URL for the device: AssistNow aiding (almanac for five
+      # constellations, predicted orbits for four, plus ionosphere and health
+      # where the profile allows) followed by this hour's GPS ephemeris from
+      # RINEX. Both halves are sanitised before being written -- the cached
+      # MGA-INI-TIME and any expired MGA-ANO are dropped -- which is what makes
+      # a single merged file coherent for a receiver that downloads it hours
+      # after it was built.
       - name: Download A-GPS (AssistNow + live RINEX ephemeris)
         env:
           # Thingstream ZTP device-profile token (a UUID). Set as a repo secret:
-          # Settings -> Secrets and variables -> Actions. Without it the script
-          # publishes the RINEX file only and leaves latest.ubx untouched.
+          # Settings -> Secrets and variables -> Actions. Without it the file is
+          # published with the RINEX GPS ephemeris only.
           ASSISTNOW_TOKEN: ${{ secrets.ASSISTNOW_TOKEN }}
         run: |
           mkdir -p docs/archive
           python3 agps_download.py \
               --no-ini \
               --min-prns 32 \
-              --output docs/archive/agps_rinex_${TS}.ubx \
-              --assistnow-output docs/archive/agps_assistnow_${TS}.ubx \
+              --output docs/archive/agps_${TS}.ubx \
               --assistnow-data both \
               --assistnow-days 3 \
               --assistnow-cache docs/agps_assistnow_cache.ubx \
@@ -60,45 +55,25 @@ jobs:
         run: |
           find docs/archive -type f -name "*.ubx" -mtime +2 -delete
 
+      # Only replace the published file with a non-empty new one: a receiver
+      # fetching latest.ubx mid-run must never get a truncated or empty blob,
+      # and it applies whatever it is given.
       - name: Update latest
         run: |
-          an="docs/archive/agps_assistnow_${TS}.ubx"
-          rn="docs/archive/agps_rinex_${TS}.ubx"
-
-          if [ -s "$rn" ]; then
-              cp "$rn" docs/latest_rinex.ubx.tmp
-              mv docs/latest_rinex.ubx.tmp docs/latest_rinex.ubx
-              echo "latest_rinex.ubx <- $rn ($(stat -c%s docs/latest_rinex.ubx) bytes)"
-          else
-              echo "::warning::no RINEX blob this run - keeping the previous docs/latest_rinex.ubx"
-          fi
-
-          # latest.ubx is the URL the device downloads, so it gets the best blob
-          # this run actually produced: u-blox AssistNow when the service
-          # answered, else the RINEX ephemeris. Only if neither exists is the
-          # previous file left in place - a receiver must never be handed a
-          # truncated or empty blob, and it applies whatever it is given.
-          if [ -s "$an" ]; then
-              src="$an"
-          else
-              src="$rn"
-              echo "::warning::AssistNow unavailable - publishing the RINEX blob as latest.ubx"
-          fi
+          src="docs/archive/agps_${TS}.ubx"
           if [ -s "$src" ]; then
               cp "$src" docs/latest.ubx.tmp
               mv docs/latest.ubx.tmp docs/latest.ubx
               echo "latest.ubx <- $src ($(stat -c%s docs/latest.ubx) bytes)"
           else
-              echo "::error::nothing published this run - keeping the previous docs/latest.ubx"
+              echo "::error::nothing produced this run - keeping the previous docs/latest.ubx"
+              exit 1
           fi
 
       # Independent re-read of exactly what is about to be published: frame
       # inventory, checksums, MGA-GPS-EPH field alignment, MGA-ANO expiry.
-      - name: Verify published files
-        run: |
-          for f in docs/latest.ubx docs/latest_rinex.ubx; do
-              [ -s "$f" ] && python3 agps_download.py --verify "$f"
-          done
+      - name: Verify published file
+        run: python3 agps_download.py --verify docs/latest.ubx
 
       - name: Create status page
         run: |
@@ -107,15 +82,11 @@ jobs:
           <body>
           <h1>A-GPS Server</h1>
           <p>Last update: ${TS} UTC</p>
-          <ul>
-            <li><a href="latest.ubx">latest.ubx</a> — u-blox AssistNow: almanac,
-                ionosphere, predicted orbits (3 days) and live ephemeris for
-                GPS, Galileo, GLONASS, BeiDou and QZSS. Use this one.</li>
-            <li><a href="latest_rinex.ubx">latest_rinex.ubx</a> — free RINEX
-                broadcast ephemeris, GPS only, refreshed hourly. Fallback that
-                needs no service token.</li>
-          </ul>
-          <p>Neither file carries UBX-MGA-INI-TIME: the receiver supplies its own
+          <p><a href="latest.ubx">latest.ubx</a> — u-blox AssistNow aiding
+          (almanac for GPS, Galileo, GLONASS, BeiDou and QZSS; predicted orbits
+          for four of them) plus this hour's GPS broadcast ephemeris from
+          RINEX, in one UBX-MGA stream.</p>
+          <p>The file carries no UBX-MGA-INI-TIME: the receiver supplies its own
           time when it applies the data, so a file downloaded hours after it was
           built is never wrong about the hour.</p>
           </body>
