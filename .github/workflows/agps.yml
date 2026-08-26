@@ -33,9 +33,15 @@ jobs:
       #
       # Three deliberately conservative choices while a fix regression on the
       # vehicle is being tracked down, each reversible without a fetch:
-      #   --publish-gnss        QZSS dropped: three satellites, all unhealthy,
-      #                         geostationary over Japan. It cannot contribute
-      #                         anything in Europe.
+      #   --publish-gnss        GLONASS and QZSS dropped: GLONASS is disabled
+      #                         on the receiver, and QZSS is three unhealthy
+      #                         satellites geostationary over Japan that never
+      #                         rise in Europe. Between them, 18% of the file the
+      #                         device downloads and throws away. Galileo and
+      #                         BeiDou stay: both are tracked, and both get
+      #                         almanac and predicted orbits (precise ephemeris
+      #                         is GPS-only, since it comes from RINEX and the
+      #                         profile refuses live orbits).
       #   --no-iono             the UBX-MGA-GPS-IONO byte layout was never
       #                         cross-checked against real service output, and a
       #                         wrong ionosphere model is worse than none. Stays
@@ -60,7 +66,7 @@ jobs:
               --output docs/archive/agps_${TS}.ubx \
               --assistnow-data both \
               --assistnow-days 3 \
-              --publish-gnss gps,gal,glo,bds,sbas \
+              --publish-gnss gps,gal,bds,sbas \
               --no-iono \
               --variants docs/test \
               --assistnow-cache docs/agps_assistnow_cache.ubx \
@@ -102,9 +108,10 @@ jobs:
           <h1>A-GPS Server</h1>
           <p>Last update: ${TS} UTC</p>
           <p><a href="latest.ubx">latest.ubx</a> — u-blox AssistNow aiding
-          (almanac and three days of predicted orbits, for GPS, Galileo,
-          GLONASS and BeiDou) plus this hour's GPS broadcast ephemeris from
-          RINEX, in one UBX-MGA stream.</p>
+          (almanac and three days of predicted orbits, for GPS, Galileo and
+          BeiDou) plus this hour's GPS broadcast ephemeris from RINEX, in one
+          UBX-MGA stream. GLONASS and QZSS are left out: the receiver does not
+          track them.</p>
           <p>The file carries no UBX-MGA-INI-TIME: the receiver supplies its own
           time when it applies the data, so a file downloaded hours after it was
           built is never wrong about the hour.</p>
@@ -116,8 +123,8 @@ jobs:
             <li><a href="test/01-eph-only.ubx">01-eph-only</a> — GPS ephemeris, nothing else</li>
             <li><a href="test/02-eph-alm.ubx">02-eph-alm</a> — plus almanac</li>
             <li><a href="test/03-eph-alm-ano1.ubx">03-eph-alm-ano1</a> — plus 1 day of predicted orbits</li>
-            <li><a href="test/04-eph-alm-ano3.ubx">04-eph-alm-ano3</a> — plus 3 days (same as latest.ubx)</li>
-            <li><a href="test/05-no-glo-qzss.ubx">05-no-glo-qzss</a> — like 04, without GLONASS and QZSS</li>
+            <li><a href="test/04-eph-alm-ano3.ubx">04-eph-alm-ano3</a> — plus 3 days: same as latest.ubx</li>
+            <li><a href="test/05-plus-glo-qzss.ubx">05-plus-glo-qzss</a> — like 04, plus GLONASS and QZSS</li>
             <li><a href="test/06-with-iono.ubx">06-with-iono</a> — like 04, plus the ionosphere model</li>
           </ul>
           </body>

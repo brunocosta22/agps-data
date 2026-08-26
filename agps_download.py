@@ -1516,8 +1516,10 @@ VARIANTS = [
     ("02-eph-alm",      dict(alm=True,  ano=0, gnss=None, iono=False)),
     ("03-eph-alm-ano1", dict(alm=True,  ano=1, gnss=None, iono=False)),
     ("04-eph-alm-ano3", dict(alm=True,  ano=3, gnss=None, iono=False)),
-    ("05-no-glo-qzss",  dict(alm=True,  ano=3, gnss={"gps", "gal", "bds", "sbas"},
-                             iono=False)),
+    # Additive branches off the top rung, for the two changes that are not about
+    # volume: putting back the constellations the receiver is not configured for,
+    # and the ionosphere frame whose byte layout is unverified.
+    ("05-plus-glo-qzss", dict(alm=True, ano=3, gnss=set(GNSS_NAMES), iono=False)),
     ("06-with-iono",    dict(alm=True,  ano=3, gnss=None, iono=True)),
 ]
 
@@ -1527,10 +1529,10 @@ def write_variants(out_dir: str, eph: bytes, iono_frame: bytes, raw: bytes,
     """Write one .ubx per hypothesis into out_dir. Returns [(name, path, lines)].
 
     The ladder is cumulative on purpose: ephemeris alone, then the almanac, then
-    one day of predicted orbits, then more days. Whichever step stops fixing is
-    the answer, and 06 and 07 branch off the middle rung to test the two changes
-    that are not about volume -- dropping the constellations the receiver may not
-    track, and the ionosphere frame whose byte layout is unverified.
+    one day of predicted orbits, then more days. Whichever rung stops fixing is
+    the answer. The last two branch off the top rung instead, for the changes
+    that are not about volume: the constellations the receiver is not configured
+    for, and the ionosphere frame whose byte layout is unverified.
 
     Rungs that do not override the constellation set use the published one, so
     the rung matching the published file is byte-identical to it: a bisect is
