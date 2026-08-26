@@ -478,12 +478,34 @@ def _order_stations_for_spread(stations: list) -> list:
     return out
 
 
+# A standard LNAV ephemeris has toc == toe: the clock polynomial and the orbit
+# share one reference time. The broadcast stream also carries records where they
+# are hours apart, with a mid-hour toc and a shared IODC -- G03 at toc 11:30:00
+# with toe 14.25 h earlier, alongside the real 12:00:00 set. Whatever those are,
+# an orbit extrapolated that far past its reference time is unusable, and they
+# have to be recognised rather than ranked: their toc is recent, so a freshness
+# test that looks at toc alone prefers them to the correct record by a couple of
+# minutes, which is exactly what put five of them in a published file.
+MAX_TOC_TOE_SPLIT_S = 14400.0   # the 4 h fit interval
+
+
 def _record_age_h(rec: dict, now_sow: float) -> float:
-    """Absolute age of a nav record in hours, the short way round the week."""
-    d = (now_sow - rec["toc_sow"]) % 604800
+    """Absolute age of a nav record in hours, the short way round the week.
+
+    Measured from toe, not toc: the fit interval is centred on toe, so that is
+    what decides whether the orbit is still usable.
+    """
+    d = (now_sow - rec["toe_sow"]) % 604800
     if d > 302400:
         d -= 604800
     return abs(d) / 3600.0
+
+
+def _record_usable(rec: dict) -> bool:
+    """False for a record whose clock and orbit reference times are too far
+    apart to be a standard 4 h ephemeris."""
+    d = abs(rec["toc_sow"] - rec["toe_sow"]) % 604800
+    return min(d, 604800 - d) <= MAX_TOC_TOE_SPLIT_S
 
 
 def download_rinex_hourly(now: datetime, max_age_h: float = 4.0,
@@ -527,8 +549,8 @@ def download_rinex_hourly(now: datetime, max_age_h: float = 4.0,
             recs = parse_gps_nav(text)
             records += recs
             iono = iono or parse_iono_klobuchar(text)
-            fresh_prns |= {r["prn"] for r in recs
-                           if _record_age_h(r, now_sow) <= max_age_h}
+            fresh_prns |= {r["prn"] for r in recs if _record_usable(r)
+                           and _record_age_h(r, now_sow) <= max_age_h}
             print(f"  hourly {st} {doy:03d}/{hh:02d}h OK — {len(fresh_prns)} PRNs "
                   f"fresh (< {max_age_h} h)", file=sys.stderr)
             if len(fresh_prns) >= min_prns:
@@ -652,14 +674,21 @@ def filter_fresh_now(records: list, now: datetime, max_age_h: float) -> list:
     max_age_h of the current time. Age is the absolute GPS time difference,
     so a toe slightly in the future (common) is handled correctly."""
     _, now_sow = _week_sow(now)
-    best = {}
+    best, split = {}, 0
 
     for r in records:
+        if not _record_usable(r):
+            split += 1
+            continue
         age_h = _record_age_h(r, now_sow)
         if age_h <= max_age_h:
             prn = r["prn"]
             if prn not in best or age_h < best[prn][0]:
                 best[prn] = (age_h, r)
+
+    if split:
+        print(f"  dropped {split} record(s) with toc and toe more than "
+              f"{MAX_TOC_TOE_SPLIT_S / 3600:.0f} h apart", file=sys.stderr)
 
     return [v for _, v in sorted(best.values(), key=lambda x: x[1]["prn"])]
 
@@ -1613,8 +1642,8 @@ def main():
     #    constellation (filter_fresh_now keeps the freshest record per PRN, so
     #    merging the two can only add coverage).
     _, now_sow = _week_sow(now)
-    fresh_prns = {r["prn"] for r in all_records
-                  if _record_age_h(r, now_sow) <= args.max_age_h}
+    fresh_prns = {r["prn"] for r in all_records if _record_usable(r)
+                  and _record_age_h(r, now_sow) <= args.max_age_h}
     want_daily = (args.source == "daily"
                   or (not all_records and args.source != "hourly")
                   or (args.source == "auto" and len(fresh_prns) < args.min_prns))
