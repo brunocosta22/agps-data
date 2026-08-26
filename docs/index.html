@@ -1,14 +1,25 @@
 <html>
 <body>
 <h1>A-GPS Server</h1>
-<p>Last update: 20260826_1142 UTC</p>
+<p>Last update: 20260826_1243 UTC</p>
 <p><a href="latest.ubx">latest.ubx</a> — u-blox AssistNow aiding
-(several days of predicted orbits for GPS, Galileo, GLONASS and
-BeiDou, and almanac while the cache still holds it) plus this hour's
-GPS broadcast ephemeris and the Klobuchar ionosphere model, both from
+(almanac and three days of predicted orbits, for GPS, Galileo,
+GLONASS and BeiDou) plus this hour's GPS broadcast ephemeris from
 RINEX, in one UBX-MGA stream.</p>
 <p>The file carries no UBX-MGA-INI-TIME: the receiver supplies its own
 time when it applies the data, so a file downloaded hours after it was
 built is never wrong about the hour.</p>
+<h2>Test variants</h2>
+<p>One file per hypothesis, all built from the same data, for
+bisecting a receiver that will not fix. Each rung adds one thing to
+the one above it.</p>
+<ul>
+  <li><a href="test/01-eph-only.ubx">01-eph-only</a> — GPS ephemeris, nothing else</li>
+  <li><a href="test/02-eph-alm.ubx">02-eph-alm</a> — plus almanac</li>
+  <li><a href="test/03-eph-alm-ano1.ubx">03-eph-alm-ano1</a> — plus 1 day of predicted orbits</li>
+  <li><a href="test/04-eph-alm-ano3.ubx">04-eph-alm-ano3</a> — plus 3 days (same as latest.ubx)</li>
+  <li><a href="test/05-no-glo-qzss.ubx">05-no-glo-qzss</a> — like 04, without GLONASS and QZSS</li>
+  <li><a href="test/06-with-iono.ubx">06-with-iono</a> — like 04, plus the ionosphere model</li>
+</ul>
 </body>
 </html>
