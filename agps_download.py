@@ -1775,6 +1775,102 @@ def write_variants(out_dir: str, eph: bytes, eph_other: bytes,
     return written
 
 
+# ── Module identity: what a hardware swap invalidates ───────────────────────
+# Every message layout in this file was taken from one interface description and
+# validated against one module. A different module or firmware is not
+# automatically a different layout -- UBX-MGA has been stable across u-blox
+# generations -- but it stops being *verified*, and two things do change with
+# the hardware and would otherwise fail silently:
+#
+#   * the constellations the receiver can track. Publishing Galileo ephemeris to
+#     a module without a Galileo receiver is bytes it downloads and discards.
+#   * the identity the ZTP request carries. It authorizes the request; the aiding
+#     that comes back is generic, so a stale identity keeps working and gives no
+#     hint that it no longer describes the hardware being fed.
+#
+# So the identity is decoded and checked on every run, and a mismatch is said
+# out loud rather than assumed harmless.
+LAYOUT_MODEL = "MAX-M10S"
+LAYOUT_FWVER = "SPG 5.10"
+LAYOUT_SOURCE = "u-blox M10 SPG 5.10 interface description (UBX-21035062)"
+
+# MON-VER spells the constellations the way this script names them, bar case.
+_MONVER_GNSS = {"GPS": "gps", "GLO": "glo", "GAL": "gal", "BDS": "bds",
+                "SBAS": "sbas", "QZSS": "qzss"}
+
+
+def decode_monver(monver_hex: str) -> dict:
+    """Pull MOD, FWVER, PROTVER and the supported constellations out of a
+    UBX-MON-VER frame given as hex. Returns {} if it cannot be read.
+
+    The payload is a run of null-terminated ASCII fields: the software and
+    hardware version, then extension strings, some of them KEY=VALUE and some a
+    semicolon-separated constellation list.
+    """
+    try:
+        raw = bytes.fromhex(monver_hex.strip())
+    except ValueError:
+        return {}
+    if len(raw) < 8 or raw[0] != 0xB5 or raw[1] != 0x62:
+        return {}
+    out, gnss = {}, set()
+    for field in raw[6:-2].split(b"\x00"):
+        if not field or not all(32 <= c < 127 for c in field):
+            continue
+        text = field.decode("ascii")
+        if "=" in text:
+            key, _, value = text.partition("=")
+            out[key.strip()] = value.strip()
+        elif ";" in text:
+            gnss |= {_MONVER_GNSS[p.strip()] for p in text.split(";")
+                     if p.strip() in _MONVER_GNSS}
+    if gnss:
+        out["gnss"] = gnss
+    return out
+
+
+def check_module_identity(monver_hex: str, gnss_eph, publish_gnss) -> list:
+    """Report what the module identity says, and warn where it disagrees with
+    what is being built. Returns the list of warnings (also printed)."""
+    info = decode_monver(monver_hex)
+    warnings = []
+    if not info:
+        warnings.append("UBX-MON-VER could not be decoded -- the module identity "
+                        "in use is unverifiable")
+        print(f"Module identity: unreadable", file=sys.stderr)
+        return _warn(warnings)
+
+    model, fwver = info.get("MOD", "?"), info.get("FWVER", "?")
+    supported = info.get("gnss", set())
+    print(f"Module identity: {model}, {fwver}, protocol "
+          f"{info.get('PROTVER', '?')}, tracks "
+          f"{', '.join(sorted(supported)) or 'unknown'}", file=sys.stderr)
+
+    if model != LAYOUT_MODEL or fwver != LAYOUT_FWVER:
+        warnings.append(
+            f"module is {model} / {fwver}, but the message layouts here were "
+            f"verified against {LAYOUT_MODEL} / {LAYOUT_FWVER} ({LAYOUT_SOURCE}). "
+            f"They are probably still right -- UBX-MGA rarely moves -- but "
+            f"'probably' is not verified: check MGA-ACK on the new hardware")
+
+    if supported:
+        for label, wanted in (("ephemeris", set(gnss_eph)),
+                              ("aiding", set(publish_gnss) - {"sbas"})):
+            extra = wanted - supported
+            if extra:
+                warnings.append(
+                    f"publishing {label} for {', '.join(sorted(extra))}, which "
+                    f"this module does not list as supported -- bytes it will "
+                    f"download and discard")
+    return _warn(warnings)
+
+
+def _warn(warnings: list) -> list:
+    for w in warnings:
+        print(f"  WARNING: {w}", file=sys.stderr)
+    return warnings
+
+
 def report_blob(label: str, blob: bytes, now: datetime, served: bool = True) -> list:
     """Print an inventory of a blob and return its list of problems."""
     lines, problems = describe_ubx(blob, now, served=served)
@@ -1959,6 +2055,7 @@ def main():
     if publish_gnss != set(GNSS_NAMES):
         print(f"Publishing aiding for: {', '.join(sorted(publish_gnss))}",
               file=sys.stderr)
+    check_module_identity(args.monver, gnss_eph, publish_gnss)
     all_records = []
 
     # 1. Hourly source first (freshest → best hot start), unless the user forced
