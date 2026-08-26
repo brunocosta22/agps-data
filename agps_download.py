@@ -1233,6 +1233,12 @@ MGA_TYPE_NAMES = {0x01: "EPH", 0x02: "ALM", 0x03: "TIMEOFF", 0x04: "HEALTH",
 MGA_ANO      = 0x20
 # Constellation message ids that carry per-SV orbit data (type 1 = ephemeris).
 MGA_GNSS_IDS = (0x00, 0x02, 0x03, 0x05, 0x06)
+# Short names, so a constellation can be dropped from the published file by the
+# name the receiver's own configuration uses. Two independent numbering schemes
+# have to agree here: the MGA message id, and the gnssId byte inside MGA-ANO.
+GNSS_BY_MSG_ID = {0x00: "gps", 0x02: "gal", 0x03: "bds", 0x05: "qzss", 0x06: "glo"}
+GNSS_BY_ANO_ID = {0: "gps", 1: "sbas", 2: "gal", 3: "bds", 5: "qzss", 6: "glo"}
+GNSS_NAMES = ("gps", "gal", "glo", "bds", "qzss", "sbas")
 
 # Empirically verified against real AssistNow output (u-blox M10 SPG 5.10) and
 # used only for sanity checks, never to rewrite payloads:
@@ -1330,7 +1336,8 @@ def _alm_stale_weeks(msg_id: int, payload: bytes, now: datetime):
 def sanitize_mga_stream(blob: bytes, now: datetime, blob_age_h: float = 0.0,
                         live_max_age_h: float = 4.0,
                         alm_max_stale_weeks: int = 26,
-                        keep_ini: bool = False, label: str = "AssistNow"):
+                        keep_ini: bool = False, gnss_keep=None,
+                        ano_max_days=None, label: str = "AssistNow"):
     """Filter a UBX-MGA stream into something safe to publish.
 
     Dropped: broken frames, UBX-MGA-INI-* (unless keep_ini -- a cached INI-TIME
@@ -1338,6 +1345,18 @@ def sanitize_mga_stream(blob: bytes, now: datetime, blob_age_h: float = 0.0,
     past, live ephemeris older than live_max_age_h (the blob's own age, since
     live orbits expire within hours), and almanac records with an impossible
     orbit or a week-of-almanac older than alm_max_stale_weeks.
+
+    ano_max_days caps how many days of predicted orbits are published, counting
+    today. It is deliberately separate from how many are fetched: the number of
+    days is part of the request string, so changing it would invalidate the cache
+    and spend a request from a daily quota that has proved tight, while the size
+    of the published file is a decision about what the device downloads. Fetch
+    generously, publish as much as is wanted.
+
+    gnss_keep, when given, is the set of constellation names to publish: aiding
+    for a system the receiver is not tracking is bytes it downloads and discards,
+    and the service has no way to ask for fewer -- 'ualm' and 'uporb_N' are
+    whole-constellation components, so the trimming happens here.
 
     Almanac records that are simply not asked for any more are *not* dropped:
     once they are in the cache they cost no further quota, so discarding them
@@ -1367,6 +1386,13 @@ def sanitize_mga_stream(blob: bytes, now: datetime, blob_age_h: float = 0.0,
             drop("MGA-INI (stale time/position)")
             continue
 
+        if gnss_keep is not None and cls == UBX_CLASS_MGA:
+            sysname = (GNSS_BY_ANO_ID.get(payload[3] if len(payload) > 3 else -1)
+                       if msg_id == MGA_ANO else GNSS_BY_MSG_ID.get(msg_id))
+            if sysname is not None and sysname not in gnss_keep:
+                drop("%s aiding (not published)" % sysname)
+                continue
+
         if cls == UBX_CLASS_MGA and msg_id == MGA_ANO:
             d = _ano_date(payload)
             try:
@@ -1376,6 +1402,9 @@ def sanitize_mga_stream(blob: bytes, now: datetime, blob_age_h: float = 0.0,
                 continue
             if day < today:
                 drop("MGA-ANO expired (%s)" % day)
+                continue
+            if ano_max_days is not None and (day - today).days >= ano_max_days:
+                drop("MGA-ANO beyond %d day(s) (%s)" % (ano_max_days, day))
                 continue
 
         if cls == UBX_CLASS_MGA and msg_id in MGA_GNSS_IDS:
@@ -1561,15 +1590,24 @@ def main():
                     help="Which aiding to fetch: 'predictive' (multi-day MGA-ANO orbits), "
                          "'live' (current ephemeris for every constellation, best TTFF, "
                          "expires in hours), or 'both' (default; one request).")
-    ap.add_argument("--assistnow-almanac", action="store_true",
-                    help="Also request the almanac (ualm). Off by default: it is "
-                         "coarse orbit data for satellites the predicted orbits "
-                         "already cover, and it was 29%% of the published file. "
-                         "What it alone covered in Europe was one Galileo and "
-                         "four GLONASS satellites, plus BeiDou GEOs and QZSS "
-                         "that never rise here. This governs the request only -- "
-                         "almanac records already in the cache keep being "
-                         "published, since they cost no further quota.")
+    ap.add_argument("--no-assistnow-almanac", action="store_true",
+                    help="Do not request the almanac (ualm). It is requested by "
+                         "default: it lets the receiver prune its search for "
+                         "satellites it has no ephemeris for. To save bytes, drop "
+                         "whole constellations with --publish-gnss instead -- the "
+                         "service has no way to ask for the almanac of only some "
+                         "systems.")
+    ap.add_argument("--publish-ano-days", type=int, default=None, metavar="N",
+                    help="Publish only N days of predicted orbits, counting "
+                         "today (default: every day the cache holds). Separate "
+                         "from --assistnow-days on purpose: that one is part of "
+                         "the request and changing it costs a fetch, this one "
+                         "only decides how big the file the device downloads is.")
+    ap.add_argument("--publish-gnss", default=",".join(GNSS_NAMES),
+                    help="Constellations to keep in the published file, "
+                         "comma-separated from %s (default: all). Aiding for a "
+                         "system the receiver does not track is bytes it "
+                         "downloads and throws away." % ", ".join(GNSS_NAMES))
     ap.add_argument("--assistnow-days", type=int, default=3,
                     help="Days of predicted orbits (MGA-ANO) to request, 1-14 "
                          "(default: 3). One day expires at the next UTC midnight, "
@@ -1627,6 +1665,15 @@ def main():
         raise SystemExit(1 if problems else 0)
 
     strict = not args.no_strict
+    publish_gnss = {s.strip().lower() for s in args.publish_gnss.split(",")
+                    if s.strip()}
+    unknown = publish_gnss - set(GNSS_NAMES)
+    if unknown:
+        raise SystemExit(f"ERROR: --publish-gnss: unknown system(s) "
+                         f"{sorted(unknown)}; pick from {', '.join(GNSS_NAMES)}")
+    if publish_gnss != set(GNSS_NAMES):
+        print(f"Publishing aiding for: {', '.join(sorted(publish_gnss))}",
+              file=sys.stderr)
     all_records = []
 
     # 1. Hourly source first (freshest → best hot start), unless the user forced
@@ -1739,13 +1786,15 @@ def main():
         raw, age_h = get_assistnow_blob(
             args.assistnow_token, args.uniqid, args.monver, args.assistnow_data,
             args.assistnow_days, args.assistnow_gnss, args.assistnow_cache,
-            max_age_h, now, args.assistnow_retry_h, args.assistnow_almanac)
+            max_age_h, now, args.assistnow_retry_h,
+            not args.no_assistnow_almanac)
         if raw:
             aiding, dropped = sanitize_mga_stream(
                 raw, now, blob_age_h=age_h,
                 live_max_age_h=args.assistnow_live_max_age_h,
                 alm_max_stale_weeks=args.alm_max_stale_weeks,
-                keep_ini=args.keep_assistnow_ini and not args.no_ini)
+                keep_ini=args.keep_assistnow_ini and not args.no_ini,
+                gnss_keep=publish_gnss, ano_max_days=args.publish_ano_days)
             for reason, count in sorted(dropped.items()):
                 print(f"  AssistNow: dropped {count} frame(s) — {reason}",
                       file=sys.stderr)

@@ -26,15 +26,25 @@ jobs:
       # mid-morning. What the service accepted is recorded in the cache
       # metadata's 'data_used'.
       #
-      # One file, one URL for the device: AssistNow predicted orbits (MGA-ANO
-      # for GPS, Galileo, BeiDou and GLONASS) followed by this hour's GPS
-      # ephemeris and the Klobuchar ionosphere, both from RINEX. The almanac is
-      # no longer requested -- coarse orbit data for satellites the predicted
-      # orbits already cover, and 29% of the file -- but whatever is already in
-      # the cache keeps being published, since it costs no further quota. Live
-      # ephemeris, the ionosphere and health are asked for but refused by this
-      # profile; 'data_used' in the cache metadata records what the last fetch
-      # actually got. Both halves are sanitised before being written -- the cached
+      # One file, one URL for the device: AssistNow almanac and predicted
+      # orbits, followed by this hour's GPS ephemeris from RINEX. Live orbits,
+      # the ionosphere and health are asked for but refused by this profile;
+      # 'data_used' in the cache metadata records what the last fetch got.
+      #
+      # Three deliberately conservative choices while a fix regression on the
+      # vehicle is being tracked down, each reversible without a fetch:
+      #   --publish-ano-days 1  three days are fetched but one is published, so
+      #                         the file stays near the ~16 KB shape that was
+      #                         known to work. Trimming here rather than in
+      #                         --assistnow-days keeps the cache valid and costs
+      #                         no quota.
+      #   --publish-gnss        QZSS dropped: three satellites, all unhealthy,
+      #                         geostationary over Japan. It cannot contribute
+      #                         anything in Europe.
+      #   --no-iono             the UBX-MGA-GPS-IONO byte layout was never
+      #                         cross-checked against real service output, and a
+      #                         wrong ionosphere model is worse than none. Stays
+      #                         off until the receiver ACKs it. Both halves are sanitised before being written -- the cached
       # MGA-INI-TIME and any expired MGA-ANO are dropped -- which is what makes
       # a single merged file coherent for a receiver that downloads it hours
       # after it was built.
@@ -52,6 +62,9 @@ jobs:
               --output docs/archive/agps_${TS}.ubx \
               --assistnow-data both \
               --assistnow-days 3 \
+              --publish-ano-days 1 \
+              --publish-gnss gps,gal,glo,bds,sbas \
+              --no-iono \
               --assistnow-cache docs/agps_assistnow_cache.ubx \
               --assistnow-max-age-h 12
 
@@ -87,10 +100,9 @@ jobs:
           <h1>A-GPS Server</h1>
           <p>Last update: ${TS} UTC</p>
           <p><a href="latest.ubx">latest.ubx</a> — u-blox AssistNow aiding
-          (several days of predicted orbits for GPS, Galileo, GLONASS and
-          BeiDou, and almanac while the cache still holds it) plus this hour's
-          GPS broadcast ephemeris and the Klobuchar ionosphere model, both from
-          RINEX, in one UBX-MGA stream.</p>
+          (almanac and one day of predicted orbits, for GPS, Galileo, GLONASS
+          and BeiDou) plus this hour's GPS broadcast ephemeris from RINEX, in
+          one UBX-MGA stream.</p>
           <p>The file carries no UBX-MGA-INI-TIME: the receiver supplies its own
           time when it applies the data, so a file downloaded hours after it was
           built is never wrong about the hour.</p>
