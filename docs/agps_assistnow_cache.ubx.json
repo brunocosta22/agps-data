@@ -1,1 +1,1 @@
-{"last_attempt_utc": "2026-08-25T13:09:05.923882+00:00"}
+{"fetched_utc": "2026-08-26T01:56:23.562857+00:00", "data": "uporb_3,ulorb_l1,ukion,usvht", "data_used": "uporb_3", "attempts": ["uporb_3,ulorb_l1,ukion,usvht", "uporb_3,ukion,usvht", "uporb_1,ukion,usvht", "uporb_3", "uporb_1", "uporb_3,ualm", "uporb_1,ualm"], "allowed_data": "ualm, uporb_1, uporb_3, uporb_7, uporb_14", "gnss": "gps,gal,glo,bds,qzss", "bytes": 27720}
