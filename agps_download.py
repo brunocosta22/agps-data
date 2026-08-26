@@ -1733,6 +1733,14 @@ def write_variants(out_dir: str, eph: bytes, eph_other: bytes,
     of its steps.
     """
     os.makedirs(out_dir, exist_ok=True)
+    # Sweep out rungs from an earlier ladder. Renaming a variant would otherwise
+    # leave the old file published and never updated again, which is the exact
+    # failure this whole directory exists to help diagnose.
+    current = {name + ".ubx" for name, _ in VARIANTS}
+    for stale in sorted(os.listdir(out_dir)):
+        if stale.endswith(".ubx") and stale not in current:
+            os.remove(os.path.join(out_dir, stale))
+            print(f"  removed stale variant {stale}", file=sys.stderr)
     written = []
     for name, opt in VARIANTS:
         # Same frame order as the published file -- aiding, then the ionosphere,
