@@ -33,18 +33,16 @@ jobs:
       #
       # Three deliberately conservative choices while a fix regression on the
       # vehicle is being tracked down, each reversible without a fetch:
-      #   --publish-ano-days 1  three days are fetched but one is published, so
-      #                         the file stays near the ~16 KB shape that was
-      #                         known to work. Trimming here rather than in
-      #                         --assistnow-days keeps the cache valid and costs
-      #                         no quota.
       #   --publish-gnss        QZSS dropped: three satellites, all unhealthy,
       #                         geostationary over Japan. It cannot contribute
       #                         anything in Europe.
       #   --no-iono             the UBX-MGA-GPS-IONO byte layout was never
       #                         cross-checked against real service output, and a
       #                         wrong ionosphere model is worse than none. Stays
-      #                         off until the receiver ACKs it. Both halves are sanitised before being written -- the cached
+      #                         off until the receiver ACKs it -- docs/test
+      #                         carries a variant with it for exactly that.
+      #   --variants docs/test  one file per hypothesis, all from this run's
+      #                         data, for bisecting a receiver that will not fix. Both halves are sanitised before being written -- the cached
       # MGA-INI-TIME and any expired MGA-ANO are dropped -- which is what makes
       # a single merged file coherent for a receiver that downloads it hours
       # after it was built.
@@ -62,9 +60,9 @@ jobs:
               --output docs/archive/agps_${TS}.ubx \
               --assistnow-data both \
               --assistnow-days 3 \
-              --publish-ano-days 1 \
               --publish-gnss gps,gal,glo,bds,sbas \
               --no-iono \
+              --variants docs/test \
               --assistnow-cache docs/agps_assistnow_cache.ubx \
               --assistnow-max-age-h 12
 
@@ -90,7 +88,11 @@ jobs:
       # Independent re-read of exactly what is about to be published: frame
       # inventory, checksums, MGA-GPS-EPH field alignment, MGA-ANO expiry.
       - name: Verify published file
-        run: python3 agps_download.py --verify docs/latest.ubx
+        run: |
+          python3 agps_download.py --verify docs/latest.ubx
+          for f in docs/test/*.ubx; do
+              [ -s "$f" ] && python3 agps_download.py --verify "$f"
+          done
 
       - name: Create status page
         run: |
@@ -100,12 +102,24 @@ jobs:
           <h1>A-GPS Server</h1>
           <p>Last update: ${TS} UTC</p>
           <p><a href="latest.ubx">latest.ubx</a> — u-blox AssistNow aiding
-          (almanac and one day of predicted orbits, for GPS, Galileo, GLONASS
-          and BeiDou) plus this hour's GPS broadcast ephemeris from RINEX, in
-          one UBX-MGA stream.</p>
+          (almanac and three days of predicted orbits, for GPS, Galileo,
+          GLONASS and BeiDou) plus this hour's GPS broadcast ephemeris from
+          RINEX, in one UBX-MGA stream.</p>
           <p>The file carries no UBX-MGA-INI-TIME: the receiver supplies its own
           time when it applies the data, so a file downloaded hours after it was
           built is never wrong about the hour.</p>
+          <h2>Test variants</h2>
+          <p>One file per hypothesis, all built from the same data, for
+          bisecting a receiver that will not fix. Each rung adds one thing to
+          the one above it.</p>
+          <ul>
+            <li><a href="test/01-eph-only.ubx">01-eph-only</a> — GPS ephemeris, nothing else</li>
+            <li><a href="test/02-eph-alm.ubx">02-eph-alm</a> — plus almanac</li>
+            <li><a href="test/03-eph-alm-ano1.ubx">03-eph-alm-ano1</a> — plus 1 day of predicted orbits</li>
+            <li><a href="test/04-eph-alm-ano3.ubx">04-eph-alm-ano3</a> — plus 3 days (same as latest.ubx)</li>
+            <li><a href="test/05-no-glo-qzss.ubx">05-no-glo-qzss</a> — like 04, without GLONASS and QZSS</li>
+            <li><a href="test/06-with-iono.ubx">06-with-iono</a> — like 04, plus the ionosphere model</li>
+          </ul>
           </body>
           </html>
           EOF

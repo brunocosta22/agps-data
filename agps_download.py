@@ -1403,7 +1403,7 @@ def sanitize_mga_stream(blob: bytes, now: datetime, blob_age_h: float = 0.0,
             if day < today:
                 drop("MGA-ANO expired (%s)" % day)
                 continue
-            if ano_max_days is not None and (day - today).days >= ano_max_days:
+            if ano_max_days is not None and (day - today).days >= max(ano_max_days, 0):
                 drop("MGA-ANO beyond %d day(s) (%s)" % (ano_max_days, day))
                 continue
 
@@ -1507,6 +1507,68 @@ def describe_ubx(blob: bytes, now: datetime = None, served: bool = True):
     return lines, problems
 
 
+# Test variants: one file per hypothesis, all built from the same fetch so the
+# only difference between them is the thing under test. Bisecting a receiver
+# that will not fix means changing one variable at a time, and files built from
+# separate runs would differ in their ephemeris too.
+VARIANTS = [
+    ("01-eph-only",     dict(alm=False, ano=0, gnss=None, iono=False)),
+    ("02-eph-alm",      dict(alm=True,  ano=0, gnss=None, iono=False)),
+    ("03-eph-alm-ano1", dict(alm=True,  ano=1, gnss=None, iono=False)),
+    ("04-eph-alm-ano3", dict(alm=True,  ano=3, gnss=None, iono=False)),
+    ("05-no-glo-qzss",  dict(alm=True,  ano=3, gnss={"gps", "gal", "bds", "sbas"},
+                             iono=False)),
+    ("06-with-iono",    dict(alm=True,  ano=3, gnss=None, iono=True)),
+]
+
+
+def write_variants(out_dir: str, eph: bytes, iono_frame: bytes, raw: bytes,
+                   age_h: float, now: datetime, args, publish_gnss=None) -> list:
+    """Write one .ubx per hypothesis into out_dir. Returns [(name, path, lines)].
+
+    The ladder is cumulative on purpose: ephemeris alone, then the almanac, then
+    one day of predicted orbits, then more days. Whichever step stops fixing is
+    the answer, and 06 and 07 branch off the middle rung to test the two changes
+    that are not about volume -- dropping the constellations the receiver may not
+    track, and the ionosphere frame whose byte layout is unverified.
+
+    Rungs that do not override the constellation set use the published one, so
+    the rung matching the published file is byte-identical to it: a bisect is
+    only as good as the single difference between two of its steps.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    written = []
+    for name, opt in VARIANTS:
+        # Same frame order as the published file -- aiding, then the ionosphere,
+        # then the ephemeris -- so the matching rung is byte-identical to it.
+        parts = []
+        if raw and (opt["alm"] or opt["ano"] != 0):
+            keep = set(opt["gnss"]) if opt["gnss"] else publish_gnss
+            blob, _ = sanitize_mga_stream(
+                raw, now, blob_age_h=age_h,
+                live_max_age_h=args.assistnow_live_max_age_h,
+                alm_max_stale_weeks=args.alm_max_stale_weeks,
+                keep_ini=False, gnss_keep=keep,
+                ano_max_days=opt["ano"] if opt["ano"] != 0 else 0,
+                label="variant " + name)
+            if not opt["alm"]:
+                blob = b"".join(
+                    _frame_bytes(blob, off, len(pl))
+                    for off, cls, msg_id, pl, ok in iter_ubx_frames(blob)
+                    if ok and not (cls == UBX_CLASS_MGA and pl and
+                                   pl[0] == MGA_TYPE_ALM))
+            parts.append(blob)
+        if opt["iono"] and iono_frame:
+            parts.append(iono_frame)
+        parts.append(eph)
+        data = b"".join(parts)
+        path = os.path.join(out_dir, name + ".ubx")
+        with open(path, "wb") as f:
+            f.write(data)
+        written.append((name, path, len(data)))
+    return written
+
+
 def report_blob(label: str, blob: bytes, now: datetime, served: bool = True) -> list:
     """Print an inventory of a blob and return its list of problems."""
     lines, problems = describe_ubx(blob, now, served=served)
@@ -1597,6 +1659,13 @@ def main():
                          "whole constellations with --publish-gnss instead -- the "
                          "service has no way to ask for the almanac of only some "
                          "systems.")
+    ap.add_argument("--variants", default=None, metavar="DIR",
+                    help="Also write one .ubx per hypothesis into DIR, all built "
+                         "from this run's data so they differ only in the thing "
+                         "under test: ephemeris alone, then almanac, then 1/3/all "
+                         "days of predicted orbits, plus one without GLONASS and "
+                         "one with the ionosphere frame. For bisecting a receiver "
+                         "that will not fix.")
     ap.add_argument("--publish-ano-days", type=int, default=None, metavar="N",
                     help="Publish only N days of predicted orbits, counting "
                          "today (default: every day the cache holds). Separate "
@@ -1748,13 +1817,16 @@ def main():
 
     # 3. Ionosphere model, if the RINEX header carried one. AssistNow will not
     #    serve it on this profile, and off the air it takes up to 12.5 min.
-    if iono and not args.no_iono:
+    iono_frame = b""
+    if iono:
         try:
-            frames.append(make_mga_gps_iono(*iono))
+            iono_frame = make_mga_gps_iono(*iono)
             print(f"Ionosphere (Klobuchar) from the RINEX header: "
                   f"alpha={iono[0]} beta={iono[1]}", file=sys.stderr)
         except ValueError as exc:
             print(f"  ionosphere rejected — {exc}", file=sys.stderr)
+    if iono_frame and not args.no_iono:
+        frames.append(iono_frame)
     elif not iono:
         print("No IONOSPHERIC CORR in the RINEX header — no ionosphere model",
               file=sys.stderr)
@@ -1779,7 +1851,7 @@ def main():
     # needs no firmware change. It is cache-gated for the service quota and
     # sanitised before use: the cached blob carries the time of its own fetch
     # and orbits that expire, neither of which may leak into a published file.
-    aiding = b""
+    aiding, raw, age_h = b"", b"", 0.0
     if args.assistnow_token:
         max_age_h = (args.assistnow_max_age_h if args.assistnow_max_age_h is not None
                      else ASSISTNOW_DEFAULT_MAX_AGE_H[args.assistnow_data])
@@ -1818,6 +1890,16 @@ def main():
         binary = aiding + binary
         print(f"Merged {len(aiding)} bytes of AssistNow aiding into "
               f"{args.output}; blob now {len(binary)} bytes", file=sys.stderr)
+
+    if args.variants:
+        eph_only = b"".join(f for f in frames if f != iono_frame)
+        for name, path, size in write_variants(args.variants, eph_only,
+                                               iono_frame, raw, age_h, now, args,
+                                               publish_gnss):
+            lines, probs = describe_ubx(open(path, "rb").read(), now)
+            print(f"  variant {name}: {size} bytes — {lines[1:]}", file=sys.stderr)
+            if probs:
+                print(f"    PROBLEM: {probs}", file=sys.stderr)
 
     problems = report_blob(f"Blob for {args.output}", binary, now,
                            served=args.no_ini)
