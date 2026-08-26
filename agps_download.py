@@ -310,6 +310,171 @@ def gps_ephem_to_ubx(rec: dict) -> bytes:
     return make_ubx_frame(UBX_CLASS_MGA, MGA_GPS, payload)
 
 
+# ── Galileo / BeiDou ephemeris → UBX-MGA-GAL-EPH / UBX-MGA-BDS-EPH ──────────
+# Offsets and scale factors below are taken from the u-blox M10 SPG 5.10
+# interface description (UBX-21035062), the firmware this module reports in
+# UBX-MON-VER -- not reconstructed. Both messages start with the same two-byte
+# type/version header as the GPS one, and the layouts differ more than a guess
+# would suggest: BeiDou carries Cuc/Cus/Cic/Cis as I4 at 2^-31 rather than I2 at
+# 2^-29, Crc/Crs as I4 at 2^-6, and toe/toc as U4 at 2^3 s.
+
+MGA_GAL = 0x02   # UBX-MGA-GAL-*
+MGA_BDS = 0x03   # UBX-MGA-BDS-*
+
+# Orbit families for the plausibility check, as joint windows on the semi-major
+# axis and the eccentricity: (sqrtA_lo, sqrtA_hi, e_lo, e_hi). Requiring both to
+# agree keeps the check tight -- a misaligned payload would have to land inside
+# one of these narrow boxes on two independent fields at once.
+#
+# Galileo has two families because it really has two: E14 and E18 (GSAT0201 and
+# 0202) went up in 2014 on a wrong, elliptical orbit and broadcast e ~ 0.168 to
+# this day. They are real satellites, so a check that rejected them would be
+# rejecting good aiding; measured against the live stream, everything else sits
+# at e < 0.001. BeiDou's C57 shows why the windows stay narrow: it broadcasts
+# a ~ 7 458 km, a perigee below the surface of the Earth, and gets dropped.
+_ORBIT_FAMILIES = {
+    "G": [(5100.0, 5200.0, 0.0, 0.03)],       # MEO, a ~ 26 560 km
+    "E": [(5430.0, 5450.0, 0.0, 0.02),        # MEO, a ~ 29 600 km
+          (5280.0, 5300.0, 0.14, 0.20)],      # E14/E18, the eccentric pair
+    "C": [(5275.0, 5290.0, 0.0, 0.02),        # MEO, a ~ 27 910 km
+          (6480.0, 6500.0, 0.0, 0.03)],       # IGSO/GEO, a ~ 42 160 km
+}
+
+
+def _sisa_index(sisa_m: float) -> int:
+    """Galileo SISA index for a signal-in-space accuracy in metres, per the
+    Galileo OS SIS ICD staircase. 255 means no prediction available."""
+    if sisa_m < 0:
+        return 255
+    if sisa_m < 0.5:
+        return _clamp(sisa_m / 0.01, 0, 49)
+    if sisa_m < 1.0:
+        return _clamp(50 + (sisa_m - 0.5) / 0.02, 50, 74)
+    if sisa_m < 2.0:
+        return _clamp(75 + (sisa_m - 1.0) / 0.04, 75, 99)
+    if sisa_m <= 6.0:
+        return _clamp(100 + (sisa_m - 2.0) / 0.16, 100, 125)
+    return 255
+
+
+def _check_eph_layout(sys_letter: str, payload: bytes, size: int,
+                      sqrta_off: int, e_off: int) -> None:
+    """Raise ValueError unless the payload looks like a real orbit read back at
+    the offsets the message specifies. The eccentricity and the semi-major axis
+    are the two fields that cannot survive a misalignment: they turn into
+    nonsense, while a correct frame always lands in its constellation's family.
+    """
+    if len(payload) != size:
+        raise ValueError("payload is %d bytes, expected %d" % (len(payload), size))
+    if payload[0] != 0x01 or payload[1] != 0x00:
+        raise ValueError("type/version = %02X/%02X, expected 01/00"
+                         % (payload[0], payload[1]))
+    e = struct.unpack_from("<I", payload, e_off)[0] * 2.0 ** -33
+    sqrt_a = struct.unpack_from("<I", payload, sqrta_off)[0] * 2.0 ** -19
+    if not any(a_lo <= sqrt_a <= a_hi and e_lo <= e <= e_hi
+               for a_lo, a_hi, e_lo, e_hi in _ORBIT_FAMILIES[sys_letter]):
+        raise ValueError("sqrtA = %.1f m^1/2 with e = %.5f matches no %s orbit "
+                         "family -- fields misaligned, or not a usable orbit"
+                         % (sqrt_a, e, sys_letter))
+
+
+def gal_ephem_to_ubx(rec: dict) -> bytes:
+    """Convert a parsed RINEX 3 Galileo nav record to UBX-MGA-GAL-EPH."""
+    semi_i4 = lambda v: _clamp(v / PI / 2 ** -31, -(2 ** 31), 2 ** 31 - 1)
+    semi_i2 = lambda v: _clamp(v / PI / 2 ** -43, -(2 ** 15), 2 ** 15 - 1)
+    rad_i2  = lambda v: _clamp(v / 2 ** -29, -(2 ** 15), 2 ** 15 - 1)
+
+    # RINEX packs the I/NAV signal health and data validity flags into one word:
+    # bit 0 E1-B DVS, bits 1-2 E1-B HS, bit 3 E5a DVS, bits 4-5 E5a HS,
+    # bit 6 E5b DVS, bits 7-8 E5b HS.
+    h = int(rec.get("sv_health", 0))
+
+    payload = struct.pack(
+        "<BBBBHhiIIiiiihhhhhhhHiibBHh2xBBBB4x",
+        0x01,                                   # U1  type = EPH
+        0x00,                                   # U1  version
+        _clamp(rec["prn"], 1, 36),              # U1  svId
+        0,                                      # U1  reserved0
+        int(rec.get("iode", 0)) & 0x3FF,        # U2  iodNav
+        semi_i2(rec["Delta_n"]),                # I2  deltaN
+        semi_i4(rec["M0"]),                     # I4  m0
+        _clamp(rec["e"] / 2 ** -33, 0, 2 ** 32 - 1),      # U4  e
+        _clamp(rec["sqrtA"] / 2 ** -19, 0, 2 ** 32 - 1),  # U4  sqrtA
+        semi_i4(rec["Omega0"]),                 # I4  omega0
+        semi_i4(rec["i0"]),                     # I4  i0
+        semi_i4(rec["omega"]),                  # I4  omega
+        _clamp(rec["Omega_dot"] / PI / 2 ** -43,
+               -(2 ** 31), 2 ** 31 - 1),        # I4  omegaDot (2^-43, like GPS)
+        semi_i2(rec["IDOT"]),                   # I2  iDot
+        rad_i2(rec["Cuc"]),                     # I2  cuc
+        rad_i2(rec["Cus"]),                     # I2  cus
+        _clamp(rec["Crc"] / 2 ** -5, -(2 ** 15), 2 ** 15 - 1),  # I2  crc
+        _clamp(rec["Crs"] / 2 ** -5, -(2 ** 15), 2 ** 15 - 1),  # I2  crs
+        rad_i2(rec["Cic"]),                     # I2  cic
+        rad_i2(rec["Cis"]),                     # I2  cis
+        int(round(rec["toe_sow"] / 60)) & 0xFFFF,          # U2  toe (60 s)
+        _clamp(rec["af0"] / 2 ** -34, -(2 ** 31), 2 ** 31 - 1),  # I4  af0
+        _clamp(rec["af1"] / 2 ** -46, -(2 ** 31), 2 ** 31 - 1),  # I4  af1
+        _clamp(rec["af2"] / 2 ** -59, -128, 127),          # I1  af2
+        _sisa_index(rec.get("sisa", -1.0)),                # U1  sisaIndexE1
+        int(round(rec["toc_sow"] / 60)) & 0xFFFF,          # U2  toc (60 s)
+        _clamp(rec.get("bgd_e5b", 0.0) / 2 ** -32, -(2 ** 15), 2 ** 15 - 1),  # I2 bgd
+        (h >> 1) & 0x3,                         # U1  healthE1B
+        h & 0x1,                                # U1  dataValidityE1
+        (h >> 7) & 0x3,                         # U1  healthE5b
+        (h >> 6) & 0x1,                         # U1  dataValidityE5b
+    )
+    _check_eph_layout("E", payload, 76, sqrta_off=16, e_off=12)
+    return make_ubx_frame(UBX_CLASS_MGA, MGA_GAL, payload)
+
+
+def bds_ephem_to_ubx(rec: dict) -> bytes:
+    """Convert a parsed RINEX 3 BeiDou nav record to UBX-MGA-BDS-EPH.
+
+    Times stay in BeiDou system time, which is what the message is defined in:
+    RINEX gives BeiDou epochs and toe in BDT already, so nothing is converted
+    here -- only the age comparison against other systems needs the 14 s offset.
+    """
+    semi_i4 = lambda v: _clamp(v / PI / 2 ** -31, -(2 ** 31), 2 ** 31 - 1)
+    semi_i2 = lambda v: _clamp(v / PI / 2 ** -43, -(2 ** 15), 2 ** 15 - 1)
+    rad_i4  = lambda v: _clamp(v / 2 ** -31, -(2 ** 31), 2 ** 31 - 1)
+
+    payload = struct.pack(
+        "<BBBBBBhiiIhBBIIIihhiiiiiiiiii4x",
+        0x01,                                   # U1  type = EPH
+        0x00,                                   # U1  version
+        _clamp(rec["prn"], 1, 63),              # U1  svId
+        0,                                      # U1  reserved0
+        int(rec.get("sv_health", 0)) & 0xFF,    # U1  SatH1
+        int(rec.get("IODC", 0)) & 0xFF,         # U1  IODC
+        _clamp(rec["af2"] / 2 ** -66, -(2 ** 15), 2 ** 15 - 1),   # I2  a2
+        _clamp(rec["af1"] / 2 ** -50, -(2 ** 31), 2 ** 31 - 1),   # I4  a1
+        _clamp(rec["af0"] / 2 ** -33, -(2 ** 31), 2 ** 31 - 1),   # I4  a0
+        int(round(rec["toc_sow"] / 8)) & 0xFFFFFFFF,              # U4  toc (2^3 s)
+        _clamp(rec.get("TGD", 0.0) / 1e-10, -(2 ** 15), 2 ** 15 - 1),  # I2 TGD1 (0.1 ns)
+        _ura_index(rec.get("sv_acc", -1.0)),    # U1  URAI
+        int(rec.get("iode", 0)) & 0xFF,         # U1  IODE
+        int(round(rec["toe_sow"] / 8)) & 0xFFFFFFFF,              # U4  toe (2^3 s)
+        _clamp(rec["sqrtA"] / 2 ** -19, 0, 2 ** 32 - 1),          # U4  sqrtA
+        _clamp(rec["e"] / 2 ** -33, 0, 2 ** 32 - 1),              # U4  e
+        semi_i4(rec["omega"]),                  # I4  omega
+        semi_i2(rec["Delta_n"]),                # I2  Deltan
+        semi_i2(rec["IDOT"]),                   # I2  IDOT
+        semi_i4(rec["M0"]),                     # I4  M0
+        semi_i4(rec["Omega0"]),                 # I4  Omega0
+        _clamp(rec["Omega_dot"] / PI / 2 ** -43, -(2 ** 31), 2 ** 31 - 1),  # I4 OmegaDot
+        semi_i4(rec["i0"]),                     # I4  i0
+        rad_i4(rec["Cuc"]),                     # I4  Cuc
+        rad_i4(rec["Cus"]),                     # I4  Cus
+        _clamp(rec["Crc"] / 2 ** -6, -(2 ** 31), 2 ** 31 - 1),    # I4  Crc
+        _clamp(rec["Crs"] / 2 ** -6, -(2 ** 31), 2 ** 31 - 1),    # I4  Crs
+        rad_i4(rec["Cic"]),                     # I4  Cic
+        rad_i4(rec["Cis"]),                     # I4  Cis
+    )
+    _check_eph_layout("C", payload, 88, sqrta_off=28, e_off=32)
+    return make_ubx_frame(UBX_CLASS_MGA, MGA_BDS, payload)
+
+
 # ── RINEX header ionosphere → UBX-MGA-GPS-IONO ──────────────────────────────
 # The Klobuchar coefficients sit in the nav file header we already download, in
 # IONOSPHERIC CORR rows, and the AssistNow profile is not entitled to them
@@ -495,7 +660,7 @@ def _record_age_h(rec: dict, now_sow: float) -> float:
     Measured from toe, not toc: the fit interval is centred on toe, so that is
     what decides whether the orbit is still usable.
     """
-    d = (now_sow - rec["toe_sow"]) % 604800
+    d = (now_sow - rec["toe_sow"] - SOW_TO_GPS_S.get(rec.get("sys", "G"), 0.0)) % 604800
     if d > 302400:
         d -= 604800
     return abs(d) / 3600.0
@@ -510,7 +675,7 @@ def _record_usable(rec: dict) -> bool:
 
 def download_rinex_hourly(now: datetime, max_age_h: float = 4.0,
                           min_prns: int = 30, max_back: int = 4,
-                          max_stations: int = 12) -> tuple:
+                          max_stations: int = 12, systems: str = "GEC") -> tuple:
     """Download hourly broadcast nav until min_prns GPS PRNs have an ephemeris
     younger than max_age_h. Returns (records, reference_datetime, iono) or
     (None, None, None); iono is the (alpha, beta) Klobuchar pair from the header.
@@ -546,10 +711,13 @@ def download_rinex_hourly(now: datetime, max_age_h: float = 4.0,
             if raw[:2] == b"\x1f\x8b":
                 raw = gzip.decompress(raw)
             text = raw.decode("ascii", errors="replace")
-            recs = parse_gps_nav(text)
+            recs = [r for s in systems for r in parse_nav(text, s)]
             records += recs
             iono = iono or parse_iono_klobuchar(text)
-            fresh_prns |= {r["prn"] for r in recs if _record_usable(r)
+            # Coverage is counted on GPS alone: it is the constellation the
+            # stations all track and the one --min-prns is about.
+            fresh_prns |= {r["prn"] for r in recs
+                           if r["sys"] == "G" and _record_usable(r)
                            and _record_age_h(r, now_sow) <= max_age_h}
             print(f"  hourly {st} {doy:03d}/{hh:02d}h OK — {len(fresh_prns)} PRNs "
                   f"fresh (< {max_age_h} h)", file=sys.stderr)
@@ -577,12 +745,14 @@ def _row(line: str):
     return [_f(line[4 + i * 19: 23 + i * 19]) for i in range(4)]
 
 
-def _toc_to_sow(year, month, day, hour, minute, second) -> float:
-    """Convert a RINEX 3 GPS nav epoch to GPS seconds-of-week.
+def _epoch_to_sow(year, month, day, hour, minute, second) -> float:
+    """Convert a RINEX 3 nav epoch to seconds-of-week in its own system time.
 
-    RINEX 3 timestamps GPS navigation records in GPS time, not UTC, so no leap
-    second is added here. Adding one made toc land 18 s past toe, which the 16 s
-    LSB then rounded into a permanent one-LSB skew between the two.
+    RINEX 3 timestamps each constellation's records in that constellation's time
+    scale, not UTC, so no leap second is added here. Adding one made GPS toc land
+    18 s past toe, which the 16 s LSB then rounded into a permanent one-LSB skew
+    between the two. Galileo shares the GPS second; BeiDou runs 14 s behind, and
+    that offset is applied only where ages are compared across systems.
     """
     if year < 100:
         year += 2000
@@ -591,7 +761,15 @@ def _toc_to_sow(year, month, day, hour, minute, second) -> float:
     return ((dt - GPS_EPOCH).total_seconds()) % 604800
 
 
-def parse_gps_nav(text: str) -> list:
+# time runs 14 s behind it. Only ages are compared across systems, so this is
+# all that has to line up -- the encoders keep each toe in its own scale, which
+# is what the receiver expects.
+SOW_TO_GPS_S = {"G": 0.0, "E": 0.0, "C": 14.0}
+RINEX_SYS_LETTER = {"gps": "G", "gal": "E", "bds": "C"}
+
+
+def parse_nav(text: str, sys_letter: str = "G") -> list:
+    """Parse the RINEX 3 navigation records of one constellation."""
     records = []
     lines = text.splitlines()
     in_header = True
@@ -609,8 +787,7 @@ def parse_gps_nav(text: str) -> list:
             i += 1
             continue
 
-        # GPS SV record starts with 'G'
-        if len(line) < 4 or line[0] != "G":
+        if len(line) < 4 or line[0] != sys_letter:
             i += 1
             continue
 
@@ -629,7 +806,6 @@ def parse_gps_nav(text: str) -> list:
             i += 1
             continue
 
-        # Read 7 broadcast orbit lines
         orbit = []
         for _ in range(7):
             i += 1
@@ -640,31 +816,42 @@ def parse_gps_nav(text: str) -> list:
         if len(orbit) < 7:
             continue
 
-        # Unpack per RINEX 3 broadcast message spec (angles in radians)
-        IODE,    Crs,    Delta_n,  M0      = orbit[0]
-        Cuc,     e,      Cus,      sqrtA   = orbit[1]
-        toe_sow, Cic,    Omega0,   Cis     = orbit[2]
+        iode,    Crs,    Delta_n,  M0        = orbit[0]
+        Cuc,     e,      Cus,      sqrtA     = orbit[1]
+        toe_sow, Cic,    Omega0,   Cis       = orbit[2]
         i0,      Crc,    omega,    Omega_dot = orbit[3]
-        IDOT,    L2codes, gps_week, L2P    = orbit[4]
-        sv_acc,  sv_hlth, TGD,     IODC   = orbit[5]
-        trans_t, fit_int                  = orbit[6][0], orbit[6][1]
+        IDOT,    _sp1,   week,     _sp2      = orbit[4]
 
-        toc_sow = _toc_to_sow(year, mon, day, hr, mn, sc)
-
-        records.append({
-            "prn": prn,
-            "toc_sow": toc_sow, "toe_sow": toe_sow,
-            "gps_week": int(gps_week),
+        rec = {
+            "sys": sys_letter, "prn": prn,
+            "toc_sow": _epoch_to_sow(year, mon, day, hr, mn, sc),
+            "toe_sow": toe_sow, "gps_week": int(week),
             "af0": af0, "af1": af1, "af2": af2,
             "Crs": Crs, "Delta_n": Delta_n, "M0": M0,
             "Cuc": Cuc, "e": e, "Cus": Cus, "sqrtA": sqrtA,
             "Cic": Cic, "Omega0": Omega0, "Cis": Cis,
             "i0": i0, "Crc": Crc, "omega": omega, "Omega_dot": Omega_dot,
-            "IDOT": IDOT, "sv_acc": sv_acc, "sv_health": int(sv_hlth),
-            "TGD": TGD, "IODC": int(IODC), "fit_int": fit_int,
-        })
+            "IDOT": IDOT, "iode": iode,
+        }
+        if sys_letter == "G":
+            rec.update(sv_acc=orbit[5][0], sv_health=int(orbit[5][1]),
+                       TGD=orbit[5][2], IODC=int(orbit[5][3]),
+                       fit_int=orbit[6][1])
+        elif sys_letter == "E":
+            # orbit[5]: SISA [m], SV health bitfield, BGD E5a/E1, BGD E5b/E1
+            rec.update(sisa=orbit[5][0], sv_health=int(orbit[5][1]),
+                       bgd_e5b=orbit[5][3], IODC=int(iode))
+        elif sys_letter == "C":
+            # orbit[5]: SV accuracy [m], SatH1, TGD1, TGD2; orbit[6][1] = AODC
+            rec.update(sv_acc=orbit[5][0], sv_health=int(orbit[5][1]),
+                       TGD=orbit[5][2], IODC=int(orbit[6][1]))
+        records.append(rec)
 
     return records
+
+
+def parse_gps_nav(text: str) -> list:
+    return parse_nav(text, "G")
 
 
 # ── Freshness filter ─────────────────────────────────────────────────────────
@@ -682,15 +869,18 @@ def filter_fresh_now(records: list, now: datetime, max_age_h: float) -> list:
             continue
         age_h = _record_age_h(r, now_sow)
         if age_h <= max_age_h:
-            prn = r["prn"]
-            if prn not in best or age_h < best[prn][0]:
-                best[prn] = (age_h, r)
+            # Key on the constellation too: PRN 3 is a different satellite in
+            # each system, and merging them would drop all but one.
+            key = (r.get("sys", "G"), r["prn"])
+            if key not in best or age_h < best[key][0]:
+                best[key] = (age_h, r)
 
     if split:
         print(f"  dropped {split} record(s) with toc and toe more than "
               f"{MAX_TOC_TOE_SPLIT_S / 3600:.0f} h apart", file=sys.stderr)
 
-    return [v for _, v in sorted(best.values(), key=lambda x: x[1]["prn"])]
+    return [v for _, v in sorted(best.values(),
+                                 key=lambda x: (x[1].get("sys", "G"), x[1]["prn"]))]
 
 
 def _week_sow(dt: datetime):
@@ -1469,6 +1659,15 @@ def describe_ubx(blob: bytes, now: datetime = None, served: bool = True):
             d = _ano_date(payload)
             if d:
                 ano_days["%04d-%02d-%02d" % d] = ano_days.get("%04d-%02d-%02d" % d, 0) + 1
+        for _sys, _mid, _size, _sa, _ee in (("E", MGA_GAL, 76, 16, 12),
+                                            ("C", MGA_BDS, 88, 28, 32)):
+            if cls == UBX_CLASS_MGA and msg_id == _mid and len(payload) == _size:
+                try:
+                    _check_eph_layout(_sys, payload, _size, _sa, _ee)
+                except ValueError as exc:
+                    problems.append("MGA-%s-EPH at byte %d: %s"
+                                    % (MGA_ID_NAMES[_mid], off, exc))
+
         if cls == UBX_CLASS_MGA and msg_id == MGA_GPS and len(payload) == 68:
             # 68 bytes is the ephemeris payload size, so whatever the first byte
             # says, this frame has to be a well-formed EPH.
@@ -1512,31 +1711,26 @@ def describe_ubx(blob: bytes, now: datetime = None, served: bool = True):
 # that will not fix means changing one variable at a time, and files built from
 # separate runs would differ in their ephemeris too.
 VARIANTS = [
-    ("01-eph-only",     dict(alm=False, ano=0, gnss=None, iono=False)),
-    ("02-eph-alm",      dict(alm=True,  ano=0, gnss=None, iono=False)),
-    ("03-eph-alm-ano1", dict(alm=True,  ano=1, gnss=None, iono=False)),
-    ("04-eph-alm-ano3", dict(alm=True,  ano=3, gnss=None, iono=False)),
-    # Additive branches off the top rung, for the two changes that are not about
-    # volume: putting back the constellations the receiver is not configured for,
-    # and the ionosphere frame whose byte layout is unverified.
-    ("05-plus-glo-qzss", dict(alm=True, ano=3, gnss=set(GNSS_NAMES), iono=False)),
-    ("06-with-iono",    dict(alm=True,  ano=3, gnss=None, iono=True)),
+    ("01-eph-gps",      dict(xeph=False, iono=False, alm=False, ano=0)),
+    ("02-eph-all",      dict(xeph=True,  iono=False, alm=False, ano=0)),
+    ("03-eph-all-iono", dict(xeph=True,  iono=True,  alm=False, ano=0)),
+    ("04-eph-alm",      dict(xeph=True,  iono=True,  alm=True,  ano=0)),
+    ("05-eph-alm-ano1", dict(xeph=True,  iono=True,  alm=True,  ano=1)),
+    ("06-full",         dict(xeph=True,  iono=True,  alm=True,  ano=None)),
 ]
 
 
-def write_variants(out_dir: str, eph: bytes, iono_frame: bytes, raw: bytes,
-                   age_h: float, now: datetime, args, publish_gnss=None) -> list:
+def write_variants(out_dir: str, eph: bytes, eph_other: bytes,
+                   iono_frame: bytes, raw: bytes, age_h: float,
+                   now: datetime, args, publish_gnss=None) -> list:
     """Write one .ubx per hypothesis into out_dir. Returns [(name, path, lines)].
 
-    The ladder is cumulative on purpose: ephemeris alone, then the almanac, then
-    one day of predicted orbits, then more days. Whichever rung stops fixing is
-    the answer. The last two branch off the top rung instead, for the changes
-    that are not about volume: the constellations the receiver is not configured
-    for, and the ionosphere frame whose byte layout is unverified.
-
-    Rungs that do not override the constellation set use the published one, so
-    the rung matching the published file is byte-identical to it: a bisect is
-    only as good as the single difference between two of its steps.
+    The ladder is cumulative and ends at exactly what is published: GPS
+    ephemeris, then Galileo and BeiDou ephemeris, then the ionosphere, then the
+    almanac, then one day of predicted orbits, then all of them. Whichever rung
+    stops fixing is the answer, and the top rung is byte-identical to
+    latest.ubx -- a bisect is only as good as the single difference between two
+    of its steps.
     """
     os.makedirs(out_dir, exist_ok=True)
     written = []
@@ -1545,7 +1739,7 @@ def write_variants(out_dir: str, eph: bytes, iono_frame: bytes, raw: bytes,
         # then the ephemeris -- so the matching rung is byte-identical to it.
         parts = []
         if raw and (opt["alm"] or opt["ano"] != 0):
-            keep = set(opt["gnss"]) if opt["gnss"] else publish_gnss
+            keep = publish_gnss
             blob, _ = sanitize_mga_stream(
                 raw, now, blob_age_h=age_h,
                 live_max_age_h=args.assistnow_live_max_age_h,
@@ -1563,6 +1757,8 @@ def write_variants(out_dir: str, eph: bytes, iono_frame: bytes, raw: bytes,
         if opt["iono"] and iono_frame:
             parts.append(iono_frame)
         parts.append(eph)
+        if opt["xeph"]:
+            parts.append(eph_other)
         data = b"".join(parts)
         path = os.path.join(out_dir, name + ".ubx")
         with open(path, "wb") as f:
@@ -1661,6 +1857,11 @@ def main():
                          "whole constellations with --publish-gnss instead -- the "
                          "service has no way to ask for the almanac of only some "
                          "systems.")
+    ap.add_argument("--gnss-eph", default="gps,gal,bds",
+                    help="Constellations to build precise broadcast ephemeris "
+                         "for, from the RINEX mixed nav file (default: "
+                         "gps,gal,bds). This is the one aiding the AssistNow "
+                         "profile cannot provide at all, and it is free.")
     ap.add_argument("--variants", default=None, metavar="DIR",
                     help="Also write one .ubx per hypothesis into DIR, all built "
                          "from this run's data so they differ only in the thing "
@@ -1736,6 +1937,11 @@ def main():
         raise SystemExit(1 if problems else 0)
 
     strict = not args.no_strict
+    gnss_eph = {s.strip().lower() for s in args.gnss_eph.split(",") if s.strip()}
+    bad_eph = gnss_eph - set(RINEX_SYS_LETTER)
+    if bad_eph:
+        raise SystemExit(f"ERROR: --gnss-eph: {sorted(bad_eph)} not available "
+                         f"from RINEX; pick from {', '.join(RINEX_SYS_LETTER)}")
     publish_gnss = {s.strip().lower() for s in args.publish_gnss.split(",")
                     if s.strip()}
     unknown = publish_gnss - set(GNSS_NAMES)
@@ -1833,14 +2039,29 @@ def main():
         print("No IONOSPHERIC CORR in the RINEX header — no ionosphere model",
               file=sys.stderr)
 
-    # 4. GPS ephemeris frames
-    conversion_errors = 0
+    # 4. Ephemeris frames, per constellation
+    encoders = {"G": gps_ephem_to_ubx, "E": gal_ephem_to_ubx, "C": bds_ephem_to_ubx}
+    want_sys = {RINEX_SYS_LETTER[s] for s in gnss_eph if s in RINEX_SYS_LETTER}
+    conversion_errors, per_sys = 0, {}
+    eph_gps, eph_other = [], []
     for rec in fresh:
+        sysl = rec.get("sys", "G")
+        if sysl not in want_sys:
+            continue
         try:
-            frames.append(gps_ephem_to_ubx(rec))
+            frame = encoders[sysl](rec)
         except Exception as exc:
-            print(f"  PRN G{rec['prn']:02d}: conversion error — {exc}", file=sys.stderr)
+            print(f"  {sysl}{rec['prn']:02d}: conversion error — {exc}",
+                  file=sys.stderr)
             conversion_errors += 1
+            continue
+        (eph_gps if sysl == "G" else eph_other).append(frame)
+        per_sys[sysl] = per_sys.get(sysl, 0) + 1
+    frames += eph_gps + eph_other
+    print("Ephemeris frames: " + ", ".join(
+        "%s %d" % (n, per_sys.get(l, 0))
+        for l, n in (("G", "GPS"), ("E", "Galileo"), ("C", "BeiDou"))
+        if l in want_sys), file=sys.stderr)
 
     if conversion_errors:
         print(f"Warning: {conversion_errors} records failed conversion", file=sys.stderr)
@@ -1894,10 +2115,9 @@ def main():
               f"{args.output}; blob now {len(binary)} bytes", file=sys.stderr)
 
     if args.variants:
-        eph_only = b"".join(f for f in frames if f != iono_frame)
-        for name, path, size in write_variants(args.variants, eph_only,
-                                               iono_frame, raw, age_h, now, args,
-                                               publish_gnss):
+        for name, path, size in write_variants(
+                args.variants, b"".join(eph_gps), b"".join(eph_other),
+                iono_frame, raw, age_h, now, args, publish_gnss):
             lines, probs = describe_ubx(open(path, "rb").read(), now)
             print(f"  variant {name}: {size} bytes — {lines[1:]}", file=sys.stderr)
             if probs:

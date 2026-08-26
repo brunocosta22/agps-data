@@ -42,11 +42,15 @@ jobs:
       #                         almanac and predicted orbits (precise ephemeris
       #                         is GPS-only, since it comes from RINEX and the
       #                         profile refuses live orbits).
-      #   --no-iono             the UBX-MGA-GPS-IONO byte layout was never
-      #                         cross-checked against real service output, and a
-      #                         wrong ionosphere model is worse than none. Stays
-      #                         off until the receiver ACKs it -- docs/test
-      #                         carries a variant with it for exactly that.
+      #   --gnss-eph            precise broadcast ephemeris for Galileo and
+      #                         BeiDou as well as GPS, built from the same RINEX
+      #                         mixed nav file. This is the one kind of aiding
+      #                         the AssistNow profile cannot provide at all --
+      #                         it refuses live orbits -- and it is free. Layouts
+      #                         come from the M10 SPG 5.10 interface description
+      #                         (UBX-21035062), the firmware in UBX-MON-VER, and
+      #                         so does the ionosphere message, which is why it
+      #                         is no longer held back.
       #   --variants docs/test  one file per hypothesis, all from this run's
       #                         data, for bisecting a receiver that will not fix. Both halves are sanitised before being written -- the cached
       # MGA-INI-TIME and any expired MGA-ANO are dropped -- which is what makes
@@ -67,7 +71,7 @@ jobs:
               --assistnow-data both \
               --assistnow-days 3 \
               --publish-gnss gps,gal,bds,sbas \
-              --no-iono \
+              --gnss-eph gps,gal,bds \
               --variants docs/test \
               --assistnow-cache docs/agps_assistnow_cache.ubx \
               --assistnow-max-age-h 12
@@ -108,10 +112,10 @@ jobs:
           <h1>A-GPS Server</h1>
           <p>Last update: ${TS} UTC</p>
           <p><a href="latest.ubx">latest.ubx</a> — u-blox AssistNow aiding
-          (almanac and three days of predicted orbits, for GPS, Galileo and
-          BeiDou) plus this hour's GPS broadcast ephemeris from RINEX, in one
-          UBX-MGA stream. GLONASS and QZSS are left out: the receiver does not
-          track them.</p>
+          (almanac and three days of predicted orbits) plus this hour's precise
+          broadcast ephemeris and ionosphere model from RINEX, in one UBX-MGA
+          stream. Ephemeris covers GPS, Galileo and BeiDou. GLONASS and QZSS are
+          left out: the receiver does not track them.</p>
           <p>The file carries no UBX-MGA-INI-TIME: the receiver supplies its own
           time when it applies the data, so a file downloaded hours after it was
           built is never wrong about the hour.</p>
@@ -120,12 +124,12 @@ jobs:
           bisecting a receiver that will not fix. Each rung adds one thing to
           the one above it.</p>
           <ul>
-            <li><a href="test/01-eph-only.ubx">01-eph-only</a> — GPS ephemeris, nothing else</li>
-            <li><a href="test/02-eph-alm.ubx">02-eph-alm</a> — plus almanac</li>
-            <li><a href="test/03-eph-alm-ano1.ubx">03-eph-alm-ano1</a> — plus 1 day of predicted orbits</li>
-            <li><a href="test/04-eph-alm-ano3.ubx">04-eph-alm-ano3</a> — plus 3 days: same as latest.ubx</li>
-            <li><a href="test/05-plus-glo-qzss.ubx">05-plus-glo-qzss</a> — like 04, plus GLONASS and QZSS</li>
-            <li><a href="test/06-with-iono.ubx">06-with-iono</a> — like 04, plus the ionosphere model</li>
+            <li><a href="test/01-eph-gps.ubx">01-eph-gps</a> — GPS ephemeris, nothing else</li>
+            <li><a href="test/02-eph-all.ubx">02-eph-all</a> — plus Galileo and BeiDou ephemeris</li>
+            <li><a href="test/03-eph-all-iono.ubx">03-eph-all-iono</a> — plus the ionosphere model</li>
+            <li><a href="test/04-eph-alm.ubx">04-eph-alm</a> — plus almanac</li>
+            <li><a href="test/05-eph-alm-ano1.ubx">05-eph-alm-ano1</a> — plus 1 day of predicted orbits</li>
+            <li><a href="test/06-full.ubx">06-full</a> — plus all 3 days: same as latest.ubx</li>
           </ul>
           </body>
           </html>
