@@ -71,23 +71,80 @@ from datetime import datetime, timezone, timedelta
 
 PI = math.pi
 
-# ── Free RINEX 3 BRDC source URLs (BKG, no auth) ────────────────────────────
-# Long-filename RINEX 3 mixed nav (GPS + GLONASS + Galileo + BeiDou)
-_BKG = "https://igs.bkg.bund.de/root_ftp"
-BRDC_URLS = [
-    _BKG + "/IGS/BRDC/{year:04d}/{doy:03d}/BRDM00DLR_S_{year:04d}{doy:03d}0000_01D_MN.rnx.gz",
-    _BKG + "/EUREF/BRDC/{year:04d}/{doy:03d}/BRDM00DLR_R_{year:04d}{doy:03d}0000_01D_MN.rnx.gz",
-    # Short-filename fallback (older naming)
-    _BKG + "/IGS/BRDC/{year:04d}/{doy:03d}/BRDM{year:04d}{doy:03d}0.rnx.gz",
-]
-
 # UBX-MGA constants
 UBX_CLASS_MGA       = 0x13
-MGA_GPS             = 0x00   # UBX-MGA-GPS-EPH
+MGA_GPS             = 0x00   # UBX-MGA-GPS-*
 MGA_INI             = 0x40   # UBX-MGA-INI-*
-GPS_LEAP_SECONDS    = 18     # GPS–UTC offset since 2017-01-01
+GPS_LEAP_SECONDS    = 18     # GPS-UTC offset since 2017-01-01
 
 GPS_EPOCH = datetime(1980, 1, 6, tzinfo=timezone.utc)
+
+
+# ── RINEX 3 providers ───────────────────────────────────────────────────────
+# Two independent archives of the same IGS products. One being down must not
+# stop a publish: on 2026-08-27 BKG stopped answering entirely and every request
+# ran to timeout, which cost twenty minutes of grinding and produced nothing.
+#
+# They differ only in plumbing. BKG serves HTTPS with one directory per hour;
+# IGN serves FTP with one directory per day and the hour inside the filename.
+# The file names are identical either way, so one regex finds the stations for a
+# given hour in either listing.
+RINEX_PROVIDERS = [
+    {
+        "name": "BKG",
+        "index": "https://igs.bkg.bund.de/root_ftp/IGS/nrt/{doy:03d}/{hh:02d}/",
+        "hourly": "https://igs.bkg.bund.de/root_ftp/IGS/nrt/{doy:03d}/{hh:02d}/"
+                  "{st}_R_{year:04d}{doy:03d}{hh:02d}00_01H_MN.rnx.gz",
+        "daily": [
+            "https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{year:04d}/{doy:03d}/"
+            "BRDM00DLR_S_{year:04d}{doy:03d}0000_01D_MN.rnx.gz",
+            "https://igs.bkg.bund.de/root_ftp/EUREF/BRDC/{year:04d}/{doy:03d}/"
+            "BRDM00DLR_R_{year:04d}{doy:03d}0000_01D_MN.rnx.gz",
+        ],
+    },
+    {
+        "name": "IGN",
+        "index": "ftp://igs.ign.fr/pub/igs/data/hourly/{year:04d}/{doy:03d}/",
+        "hourly": "ftp://igs.ign.fr/pub/igs/data/hourly/{year:04d}/{doy:03d}/"
+                  "{st}_R_{year:04d}{doy:03d}{hh:02d}00_01H_MN.rnx.gz",
+        "daily": [
+            "ftp://igs.ign.fr/pub/igs/data/{year:04d}/{doy:03d}/"
+            "BRDM00DLR_S_{year:04d}{doy:03d}0000_01D_MN.rnx.gz",
+        ],
+    },
+]
+
+INDEX_TIMEOUT_S = 12
+FILE_TIMEOUT_S = 15
+
+
+def _fetch(url: str, timeout: float) -> bytes:
+    """GET a URL, transparently gunzipping. Raises urllib.error.URLError."""
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        raw = r.read()
+    if raw[:2] == b"\x1f\x8b":
+        raw = gzip.decompress(raw)
+    return raw
+
+
+def _list_hourly_stations(provider: dict, year: int, doy: int, hh: int):
+    """Stations with an hourly mixed-nav file for that hour at that provider.
+
+    Returns the station list, [] if the hour is not published there yet, or None
+    if the provider could not be reached at all -- which is the case worth
+    telling apart, since probing a dozen filenames against an unreachable server
+    only multiplies the timeouts.
+    """
+    url = provider["index"].format(year=year, doy=doy, hh=hh)
+    try:
+        listing = _fetch(url, INDEX_TIMEOUT_S).decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        return [] if exc.code == 404 else None
+    except (urllib.error.URLError, OSError):
+        return None
+    pattern = (r"([A-Z0-9]{9})_R_%04d%03d%02d00_01H_MN\.rnx\.gz"
+               % (year, doy, hh))
+    return sorted(set(re.findall(pattern, listing)))
 
 
 # ── UBX frame builder ────────────────────────────────────────────────────────
@@ -560,33 +617,28 @@ def _doy(dt: datetime) -> int:
 
 
 def download_rinex(date: datetime) -> str:
+    """Whole-day mixed nav for a date, from whichever provider answers."""
     year, doy = date.year, _doy(date)
-    for template in BRDC_URLS:
-        url = template.format(year=year, doy=doy)
-        print(f"Trying {url}", file=sys.stderr)
-        try:
-            with urllib.request.urlopen(url, timeout=30) as r:
-                raw = r.read()
-            if raw[:2] == b"\x1f\x8b":   # gzip magic
-                raw = gzip.decompress(raw)
-            text = raw.decode("ascii", errors="replace")
+    for provider in RINEX_PROVIDERS:
+        for template in provider["daily"]:
+            url = template.format(year=year, doy=doy)
+            print(f"Trying {provider['name']}: {url}", file=sys.stderr)
+            try:
+                text = _fetch(url, FILE_TIMEOUT_S).decode("ascii", errors="replace")
+            except (urllib.error.URLError, OSError) as exc:
+                print(f"  Failed: {exc}", file=sys.stderr)
+                continue
             print(f"  OK — {len(text)} chars", file=sys.stderr)
             return text
-        except urllib.error.URLError as exc:
-            print(f"  Failed: {exc}", file=sys.stderr)
     raise RuntimeError(
-        "Could not download RINEX from any source. "
-        "Try --date YYYY-MM-DD for a past date (yesterday's file is always available)."
-    )
+        "Could not download the daily RINEX from any provider. "
+        "Try --date YYYY-MM-DD for a past date (yesterday's file is always available).")
 
 
-# ── Hourly RINEX 3 BRDC (fresh ephemeris for a true hot start) ──────────────
-# BKG near-real-time tree: /IGS/nrt/{doy}/{hh}/{STATION}_R_{yyyy}{doy}{hh}00_01H_MN.rnx.gz
-# Each file is one station's broadcast nav for that hour (toe within ~1 h);
-# several are merged, chosen for geographic spread (see HOURLY_REGION_ORDER).
-_BKG_NRT = _BKG + "/IGS/nrt"
-_HOURLY_RE = r'([A-Z0-9]{9})_R_\d+_01H_MN\.rnx\.gz'
-
+# ── Hourly station selection ────────────────────────────────────────────────
+# Each hourly file is one station's broadcast nav for that hour (toe within
+# ~1 h); several are merged, chosen for geographic spread.
+#
 # An hourly file only holds what that station tracked during that hour, so
 # geographic spread — not proximity — is what covers the constellation:
 # broadcast ephemeris is identical wherever it is received, and satellites out
@@ -599,35 +651,6 @@ HOURLY_REGION_ORDER = [
     "IND", "CAN", "KEN", "REU", "GUF", "NCL", "SYC", "UZB", "DJI", "BES",
     "MTQ", "SPM", "ISL", "FIN", "SWE", "GRC", "TUR", "CYP", "UKR",
 ]
-# Used only when the directory index cannot be read.
-HOURLY_STATIONS_FALLBACK = [
-    "RAEG00PRT", "ALAC00ESP", "NNOR00AUS", "AREG00PER", "GAMG00KOR",
-    "HARB00ZAF", "FAA100PYF", "THU200GRL", "MGUE00ARG", "PTGG00PHL",
-    "GDKG00IND", "YEL200CAN", "MAL200KEN", "REUN00REU", "KOUR00GUF",
-    "CEBR00ESP", "CACE00ESP", "NKLG00GAB", "REYK00ISL", "BRUX00BEL",
-]
-
-
-def _list_hourly_stations(doy: int, hh: int):
-    """Stations with an hourly mixed-nav file in the BKG NRT tree for that hour.
-
-    Reading the index first turns a list of guesses into the list that actually
-    exists, so no round-trip is spent on a 404. Returns the station list, [] if
-    the hour is not published yet (so the caller moves straight to the previous
-    hour instead of probing a dozen missing files), or None if the index itself
-    could not be read and the built-in list should be used.
-    """
-    url = f"{_BKG_NRT}/{doy:03d}/{hh:02d}/"
-    try:
-        with urllib.request.urlopen(url, timeout=20) as r:
-            html = r.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        return [] if exc.code == 404 else None
-    except urllib.error.URLError:
-        return None
-    return sorted(set(re.findall(_HOURLY_RE, html)))
-
-
 def _order_stations_for_spread(stations: list) -> list:
     """Round-robin the stations across regions, preferred regions first."""
     by_region = {}
@@ -682,52 +705,64 @@ def download_rinex_hourly(now: datetime, max_age_h: float = 4.0,
 
     The stop criterion counts *fresh* PRNs, not PRNs present: every station also
     holds the last ephemeris it heard from satellites long out of view, so
-    counting records made three Iberian stations look like full coverage while
-    a third of the constellation was ten hours stale and dropped later.
+    counting records made three Iberian stations look like full coverage while a
+    third of the constellation was ten hours stale and dropped later.
+
+    Providers are tried in turn per hour, and one that cannot be reached is
+    abandoned for that hour rather than probed station by station.
     """
     _, now_sow = _week_sow(now)
     for back in range(max_back):
         t = now - timedelta(hours=back)
         year, doy, hh = t.year, _doy(t), t.hour
-        stations = _list_hourly_stations(doy, hh)
-        if stations == []:
-            print(f"  hourly {doy:03d}/{hh:02d}h not published yet — trying the "
-                  "previous hour", file=sys.stderr)
-            continue
-        if stations is None:
-            print(f"  hourly {doy:03d}/{hh:02d}h: no directory index, using the "
-                  "built-in station list", file=sys.stderr)
-            stations = HOURLY_STATIONS_FALLBACK
-        order = _order_stations_for_spread(stations)[:max_stations]
-        records, fresh_prns, iono = [], set(), None
-        for st in order:
-            url = (f"{_BKG_NRT}/{doy:03d}/{hh:02d}/"
-                   f"{st}_R_{year:04d}{doy:03d}{hh:02d}00_01H_MN.rnx.gz")
-            try:
-                with urllib.request.urlopen(url, timeout=20) as r:
-                    raw = r.read()
-            except urllib.error.URLError:
+        for provider in RINEX_PROVIDERS:
+            stations = _list_hourly_stations(provider, year, doy, hh)
+            if stations is None:
+                print(f"  hourly {doy:03d}/{hh:02d}h: {provider['name']} "
+                      f"unreachable — next provider", file=sys.stderr)
                 continue
-            if raw[:2] == b"\x1f\x8b":
-                raw = gzip.decompress(raw)
-            text = raw.decode("ascii", errors="replace")
-            recs = [r for s in systems for r in parse_nav(text, s)]
-            records += recs
-            iono = iono or parse_iono_klobuchar(text)
-            # Coverage is counted on GPS alone: it is the constellation the
-            # stations all track and the one --min-prns is about.
-            fresh_prns |= {r["prn"] for r in recs
-                           if r["sys"] == "G" and _record_usable(r)
-                           and _record_age_h(r, now_sow) <= max_age_h}
-            print(f"  hourly {st} {doy:03d}/{hh:02d}h OK — {len(fresh_prns)} PRNs "
-                  f"fresh (< {max_age_h} h)", file=sys.stderr)
-            if len(fresh_prns) >= min_prns:
-                break
-        if records:
-            print(f"Hourly ephemeris @ {doy:03d}/{hh:02d}h UTC: {len(records)} "
-                  f"records, {len(fresh_prns)} PRNs fresher than {max_age_h} h",
-                  file=sys.stderr)
-            return records, t, iono
+            if not stations:
+                print(f"  hourly {doy:03d}/{hh:02d}h: not published at "
+                      f"{provider['name']} yet", file=sys.stderr)
+                continue
+
+            order = _order_stations_for_spread(stations)[:max_stations]
+            records, fresh_prns, iono, misses = [], set(), None, 0
+            for st in order:
+                url = provider["hourly"].format(year=year, doy=doy, hh=hh, st=st)
+                try:
+                    raw = _fetch(url, FILE_TIMEOUT_S)
+                except (urllib.error.URLError, OSError):
+                    misses += 1
+                    # A listed file that will not come down twice in a row means
+                    # the archive itself is in trouble, not the station.
+                    if misses >= 3 and not records:
+                        print(f"  hourly {provider['name']}: {misses} listed "
+                              f"files failed — giving up on this provider",
+                              file=sys.stderr)
+                        break
+                    continue
+                text = raw.decode("ascii", errors="replace")
+                recs = [r for s in systems for r in parse_nav(text, s)]
+                records += recs
+                iono = iono or parse_iono_klobuchar(text)
+                # Coverage is counted on GPS alone: it is the constellation the
+                # stations all track and the one --min-prns is about.
+                fresh_prns |= {r["prn"] for r in recs
+                               if r["sys"] == "G" and _record_usable(r)
+                               and _record_age_h(r, now_sow) <= max_age_h}
+                print(f"  hourly {st} {doy:03d}/{hh:02d}h OK ({provider['name']}) "
+                      f"— {len(fresh_prns)} PRNs fresh (< {max_age_h} h)",
+                      file=sys.stderr)
+                if len(fresh_prns) >= min_prns:
+                    break
+
+            if records:
+                print(f"Hourly ephemeris @ {doy:03d}/{hh:02d}h UTC from "
+                      f"{provider['name']}: {len(records)} records, "
+                      f"{len(fresh_prns)} GPS PRNs fresher than {max_age_h} h",
+                      file=sys.stderr)
+                return records, t, iono
     return None, None, None
 
 
@@ -2099,14 +2134,19 @@ def main():
             print(f"Parsed {len(daily)} GPS records from daily data", file=sys.stderr)
             all_records += daily
 
+    # A RINEX outage is not fatal. The AssistNow half of the file -- almanac and
+    # predicted orbits -- comes from somewhere else entirely and is aiding worth
+    # publishing on its own; refusing to publish anything would freeze the served
+    # file and let its ephemeris go stale with nothing replacing it.
     if not all_records:
-        raise SystemExit("ERROR: Could not download ephemeris from any source.")
+        print("WARNING: no RINEX ephemeris from any provider — publishing the "
+              "AssistNow aiding alone this run", file=sys.stderr)
 
     # Keep the freshest record per PRN relative to NOW (works for both sources).
-    fresh = filter_fresh_now(all_records, now, args.max_age_h)
+    fresh = filter_fresh_now(all_records, now, args.max_age_h) if all_records else []
     print(f"Fresh records (< {args.max_age_h}h): {len(fresh)}", file=sys.stderr)
 
-    if not fresh:
+    if all_records and not fresh:
         # Relax to 24 h — better an assisted/warm start than nothing.
         fresh = filter_fresh_now(all_records, now, 24.0)
         print(f"Relaxed to 24h → {len(fresh)} records", file=sys.stderr)
