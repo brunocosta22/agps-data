@@ -2,31 +2,12 @@ name: refresh-agps
 
 on:
   schedule:
-    # Hourly is what is wanted, and GitHub will not deliver it. From 11 to 25
-    # August this cron produced 23 runs a day without missing one; from the 26th
-    # it produced between 2 and 6, every one of them succeeding in under half a
-    # minute. Scheduled events are best-effort by documentation and these are
-    # being dropped, not failed, so nothing in the job can fix it.
-    #
-    # It matters because broadcast ephemeris is only valid for its ~4 h fit
-    # interval. Measured on a file built at 05:29, read at 09:57: 31 of 31
-    # Galileo frames and 36 of 37 BeiDou frames already out of fit. At a
-    # six-hour cadence the precise ephemeris this file works to assemble is dead
-    # for most of the interval and only the predicted orbits still carry it.
-    #
-    # So the run does not depend on being scheduled hourly: it refreshes, then
-    # stays alive and refreshes again every hour for as long as GitHub lets the
-    # job live. The schedule only has to land occasionally. A new scheduled run
-    # cancels the previous one (see concurrency) and starts a fresh loop on
-    # whatever code is now on the branch.
+    # Hourly. Broadcast ephemeris is only valid for its ~4 h fit interval, so a
+    # slower cadence publishes data that has expired before the next run
+    # replaces it: measured on a file built at 05:29 and read at 09:57, 31 of 31
+    # Galileo frames and 36 of 37 BeiDou frames were already out of fit.
     - cron: "15 * * * *"
   workflow_dispatch:
-
-# One refresher at a time. A newly scheduled run replaces the loop that is
-# already going rather than publishing alongside it.
-concurrency:
-  group: refresh-agps
-  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -34,35 +15,17 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # GitHub kills hosted jobs at 6 h. Stop just short, so the last iteration
-    # finishes and pushes rather than being cut off mid-run.
-    timeout-minutes: 340
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Refresh now, then hourly for as long as this run lives
+      # Build, prune, publish, verify and commit. The whole refresh lives in
+      # refresh.sh so it can be run against a checkout by hand and reproduce
+      # exactly what CI does -- PUBLISH=0 builds without committing.
+      - name: Refresh A-GPS
         env:
           # Thingstream ZTP device-profile token (a UUID). Set as a repo secret:
           # Settings -> Secrets and variables -> Actions. Without it the file is
           # published with the RINEX ephemeris and ionosphere only.
           ASSISTNOW_TOKEN: ${{ secrets.ASSISTNOW_TOKEN }}
-          ITERATIONS: "6"
-          SLEEP_SECONDS: "3300"   # 55 min, so an hourly slot is never missed
-        run: |
-          for i in $(seq 1 "$ITERATIONS"); do
-              if [ "$i" -gt 1 ]; then
-                  echo "::group::waiting ${SLEEP_SECONDS}s before refresh $i/$ITERATIONS"
-                  sleep "$SLEEP_SECONDS"
-                  echo "::endgroup::"
-              fi
-              echo "::group::refresh $i/$ITERATIONS"
-              # A failed iteration must not end the loop: the next hour may well
-              # work, and the previously published file keeps being served.
-              if TS=$(date -u +%Y%m%d_%H%M) ./refresh.sh; then
-                  echo "refresh $i ok"
-              else
-                  echo "::warning::refresh $i failed; keeping the previous published file"
-              fi
-              echo "::endgroup::"
-          done
+        run: ./refresh.sh
