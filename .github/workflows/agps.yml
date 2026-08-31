@@ -2,21 +2,31 @@ name: refresh-agps
 
 on:
   schedule:
-    # Asking three times an hour for what is wanted once. GitHub fires scheduled
-    # workflows on a best-effort basis and drops them under load: with an hourly
-    # cron, the observed cadence over 2026-08-27..31 was one run every 4 to 7
-    # hours, every one of them succeeding in under half a minute. That matters
-    # because broadcast ephemeris is only valid for its ~4 h fit interval, so at
-    # a six-hour cadence most of what is published has expired before the next
-    # run replaces it -- measured on the 05:29 file at 09:57: 31 of 31 Galileo
-    # frames and 36 of 37 BeiDou frames already out of fit.
+    # Hourly is what is wanted, and GitHub will not deliver it. From 11 to 25
+    # August this cron produced 23 runs a day without missing one; from the 26th
+    # it produced between 2 and 6, every one of them succeeding in under half a
+    # minute. Scheduled events are best-effort by documentation and these are
+    # being dropped, not failed, so nothing in the job can fix it.
     #
-    # More attempts is a lottery ticket, not a fix. The only reliable trigger is
-    # an external one: POST to the workflow's dispatches endpoint from a
-    # scheduler that does keep time. The predicted orbits are what carry the
-    # file between runs meanwhile, which is why three days of them are fetched.
-    - cron: "*/20 * * * *"
+    # It matters because broadcast ephemeris is only valid for its ~4 h fit
+    # interval. Measured on a file built at 05:29, read at 09:57: 31 of 31
+    # Galileo frames and 36 of 37 BeiDou frames already out of fit. At a
+    # six-hour cadence the precise ephemeris this file works to assemble is dead
+    # for most of the interval and only the predicted orbits still carry it.
+    #
+    # So the run does not depend on being scheduled hourly: it refreshes, then
+    # stays alive and refreshes again every hour for as long as GitHub lets the
+    # job live. The schedule only has to land occasionally. A new scheduled run
+    # cancels the previous one (see concurrency) and starts a fresh loop on
+    # whatever code is now on the branch.
+    - cron: "15 * * * *"
   workflow_dispatch:
+
+# One refresher at a time. A newly scheduled run replaces the loop that is
+# already going rather than publishing alongside it.
+concurrency:
+  group: refresh-agps
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -24,151 +34,35 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # GitHub kills hosted jobs at 6 h. Stop just short, so the last iteration
+    # finishes and pushes rather than being cut off mid-run.
+    timeout-minutes: 340
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Generate timestamp
-        run: |
-          echo "TS=$(date -u +%Y%m%d_%H%M)" >> $GITHUB_ENV
-
-      # 12 h, not hourly: this device profile has been refusing the richer
-      # requests, and predicted orbits for the day do not go stale within it. The cache is refreshed anyway the moment its MGA-ANO are
-      # for a past day, so the midnight rollover is covered without spending the
-      # service quota -- which, at one attempt per hour, ran out before
-      # mid-morning. What the service accepted is recorded in the cache
-      # metadata's 'data_used'.
-      #
-      # One file, one URL for the device: AssistNow almanac and predicted
-      # orbits, followed by this hour's GPS ephemeris from RINEX. Live orbits,
-      # the ionosphere and health are asked for but refused by this profile;
-      # 'data_used' in the cache metadata records what the last fetch got.
-      #
-      # Three deliberately conservative choices while a fix regression on the
-      # vehicle is being tracked down, each reversible without a fetch:
-      #   --publish-gnss        GLONASS and QZSS dropped: GLONASS is disabled
-      #                         on the receiver, and QZSS is three unhealthy
-      #                         satellites geostationary over Japan that never
-      #                         rise in Europe. Between them, 18% of the file the
-      #                         device downloads and throws away. Galileo and
-      #                         BeiDou stay: both are tracked, and both get
-      #                         almanac and predicted orbits (precise ephemeris
-      #                         is GPS-only, since it comes from RINEX and the
-      #                         profile refuses live orbits).
-      #   --gnss-eph            precise broadcast ephemeris for Galileo and
-      #                         BeiDou as well as GPS, built from the same RINEX
-      #                         mixed nav file. This is the one kind of aiding
-      #                         the AssistNow profile cannot provide at all --
-      #                         it refuses live orbits -- and it is free. Layouts
-      #                         come from the M10 SPG 5.10 interface description
-      #                         (UBX-21035062), the firmware in UBX-MON-VER, and
-      #                         so does the ionosphere message, which is why it
-      #                         is no longer held back.
-      #   --variants docs/test  one file per hypothesis, all from this run's
-      #                         data, for bisecting a receiver that will not fix. Both halves are sanitised before being written -- the cached
-      # MGA-INI-TIME and any expired MGA-ANO are dropped -- which is what makes
-      # a single merged file coherent for a receiver that downloads it hours
-      # after it was built.
-      - name: Download A-GPS (AssistNow + live RINEX ephemeris)
+      - name: Refresh now, then hourly for as long as this run lives
         env:
           # Thingstream ZTP device-profile token (a UUID). Set as a repo secret:
           # Settings -> Secrets and variables -> Actions. Without it the file is
-          # published with the RINEX GPS ephemeris only.
+          # published with the RINEX ephemeris and ionosphere only.
           ASSISTNOW_TOKEN: ${{ secrets.ASSISTNOW_TOKEN }}
+          ITERATIONS: "6"
+          SLEEP_SECONDS: "3300"   # 55 min, so an hourly slot is never missed
         run: |
-          mkdir -p docs/archive
-          python3 agps_download.py \
-              --no-ini \
-              --min-prns 32 \
-              --output docs/archive/agps_${TS}.ubx \
-              --assistnow-data both \
-              --assistnow-days 3 \
-              --publish-gnss gps,gal,bds,sbas \
-              --gnss-eph gps,gal,bds \
-              --variants docs/test \
-              --assistnow-cache docs/agps_assistnow_cache.ubx \
-              --assistnow-max-age-h 12
-
-      # Prune by the date in the filename, not by mtime. Every file in a fresh
-      # checkout carries the time of the checkout, so `find -mtime +2` matched
-      # nothing at all and the archive grew unchecked for two months -- 1351
-      # files, back to June. git add stages the deletions.
-      - name: Cleanup old files
-        run: |
-          cutoff=$(date -u -d '2 days ago' +%Y%m%d)
-          removed=0
-          for f in docs/archive/*.ubx; do
-              [ -e "$f" ] || continue
-              day=$(basename "$f" | grep -oE '[0-9]{8}' | head -1)
-              if [ -n "$day" ] && [ "$day" -lt "$cutoff" ]; then
-                  rm -f "$f"
-                  removed=$((removed + 1))
+          for i in $(seq 1 "$ITERATIONS"); do
+              if [ "$i" -gt 1 ]; then
+                  echo "::group::waiting ${SLEEP_SECONDS}s before refresh $i/$ITERATIONS"
+                  sleep "$SLEEP_SECONDS"
+                  echo "::endgroup::"
               fi
+              echo "::group::refresh $i/$ITERATIONS"
+              # A failed iteration must not end the loop: the next hour may well
+              # work, and the previously published file keeps being served.
+              if TS=$(date -u +%Y%m%d_%H%M) ./refresh.sh; then
+                  echo "refresh $i ok"
+              else
+                  echo "::warning::refresh $i failed; keeping the previous published file"
+              fi
+              echo "::endgroup::"
           done
-          echo "pruned $removed archive file(s) older than $cutoff; $(ls docs/archive/*.ubx 2>/dev/null | wc -l) left"
-
-      # Only replace the published file with a non-empty new one: a receiver
-      # fetching latest.ubx mid-run must never get a truncated or empty blob,
-      # and it applies whatever it is given.
-      - name: Update latest
-        run: |
-          src="docs/archive/agps_${TS}.ubx"
-          if [ -s "$src" ]; then
-              cp "$src" docs/latest.ubx.tmp
-              mv docs/latest.ubx.tmp docs/latest.ubx
-              echo "latest.ubx <- $src ($(stat -c%s docs/latest.ubx) bytes)"
-          else
-              echo "::error::nothing produced this run - keeping the previous docs/latest.ubx"
-              exit 1
-          fi
-
-      # Independent re-read of exactly what is about to be published: frame
-      # inventory, checksums, MGA-GPS-EPH field alignment, MGA-ANO expiry.
-      - name: Verify published file
-        run: |
-          python3 agps_download.py --verify docs/latest.ubx
-          for f in docs/test/*.ubx; do
-              [ -s "$f" ] && python3 agps_download.py --verify "$f"
-          done
-
-      - name: Create status page
-        run: |
-          cat <<EOF > docs/index.html
-          <html>
-          <body>
-          <h1>A-GPS Server</h1>
-          <p>Last update: ${TS} UTC</p>
-          <p><a href="latest.ubx">latest.ubx</a> — u-blox AssistNow aiding
-          (almanac and three days of predicted orbits) plus this hour's precise
-          broadcast ephemeris and ionosphere model from RINEX, in one UBX-MGA
-          stream. Ephemeris covers GPS, Galileo and BeiDou. GLONASS and QZSS are
-          left out: the receiver does not track them.</p>
-          <p>The file carries no UBX-MGA-INI-TIME: the receiver supplies its own
-          time when it applies the data, so a file downloaded hours after it was
-          built is never wrong about the hour.</p>
-          <h2>Test variants</h2>
-          <p>One file per hypothesis, all built from the same data, for
-          bisecting a receiver that will not fix. Each rung adds one thing to
-          the one above it.</p>
-          <ul>
-            <li><a href="test/01-eph-gps.ubx">01-eph-gps</a> — GPS ephemeris, nothing else</li>
-            <li><a href="test/02-eph-all.ubx">02-eph-all</a> — plus Galileo and BeiDou ephemeris</li>
-            <li><a href="test/03-eph-all-iono.ubx">03-eph-all-iono</a> — plus the ionosphere model</li>
-            <li><a href="test/04-eph-alm.ubx">04-eph-alm</a> — plus almanac</li>
-            <li><a href="test/05-eph-alm-ano1.ubx">05-eph-alm-ano1</a> — plus 1 day of predicted orbits</li>
-            <li><a href="test/06-full.ubx">06-full</a> — plus all 3 days: same as latest.ubx</li>
-          </ul>
-          </body>
-          </html>
-          EOF
-
-      - name: Commit changes
-        run: |
-          git config user.name "agps-bot"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add docs/
-
-          git commit -m "A-GPS refresh ${TS}" || echo "No changes"
-
-          git push
