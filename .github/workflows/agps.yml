@@ -89,9 +89,23 @@ jobs:
               --assistnow-cache docs/agps_assistnow_cache.ubx \
               --assistnow-max-age-h 12
 
+      # Prune by the date in the filename, not by mtime. Every file in a fresh
+      # checkout carries the time of the checkout, so `find -mtime +2` matched
+      # nothing at all and the archive grew unchecked for two months -- 1351
+      # files, back to June. git add stages the deletions.
       - name: Cleanup old files
         run: |
-          find docs/archive -type f -name "*.ubx" -mtime +2 -delete
+          cutoff=$(date -u -d '2 days ago' +%Y%m%d)
+          removed=0
+          for f in docs/archive/*.ubx; do
+              [ -e "$f" ] || continue
+              day=$(basename "$f" | grep -oE '[0-9]{8}' | head -1)
+              if [ -n "$day" ] && [ "$day" -lt "$cutoff" ]; then
+                  rm -f "$f"
+                  removed=$((removed + 1))
+              fi
+          done
+          echo "pruned $removed archive file(s) older than $cutoff; $(ls docs/archive/*.ubx 2>/dev/null | wc -l) left"
 
       # Only replace the published file with a non-empty new one: a receiver
       # fetching latest.ubx mid-run must never get a truncated or empty blob,
