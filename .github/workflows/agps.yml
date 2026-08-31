@@ -2,7 +2,20 @@ name: refresh-agps
 
 on:
   schedule:
-    - cron: "15 * * * *"
+    # Asking three times an hour for what is wanted once. GitHub fires scheduled
+    # workflows on a best-effort basis and drops them under load: with an hourly
+    # cron, the observed cadence over 2026-08-27..31 was one run every 4 to 7
+    # hours, every one of them succeeding in under half a minute. That matters
+    # because broadcast ephemeris is only valid for its ~4 h fit interval, so at
+    # a six-hour cadence most of what is published has expired before the next
+    # run replaces it -- measured on the 05:29 file at 09:57: 31 of 31 Galileo
+    # frames and 36 of 37 BeiDou frames already out of fit.
+    #
+    # More attempts is a lottery ticket, not a fix. The only reliable trigger is
+    # an external one: POST to the workflow's dispatches endpoint from a
+    # scheduler that does keep time. The predicted orbits are what carry the
+    # file between runs meanwhile, which is why three days of them are fetched.
+    - cron: "*/20 * * * *"
   workflow_dispatch:
 
 permissions:
