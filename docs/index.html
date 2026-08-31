@@ -1,19 +1,18 @@
 <html>
 <body>
 <h1>A-GPS Server</h1>
-<p>Last update: 20260831_0529 UTC</p>
-<p><a href="latest.ubx">latest.ubx</a> — u-blox AssistNow aiding
-(almanac and three days of predicted orbits) plus this hour's precise
-broadcast ephemeris and ionosphere model from RINEX, in one UBX-MGA
-stream. Ephemeris covers GPS, Galileo and BeiDou. GLONASS and QZSS are
-left out: the receiver does not track them.</p>
-<p>The file carries no UBX-MGA-INI-TIME: the receiver supplies its own
-time when it applies the data, so a file downloaded hours after it was
-built is never wrong about the hour.</p>
+<p>Last update: 20260831_1447 UTC</p>
+<p><a href="latest.ubx">latest.ubx</a> — u-blox AssistNow aiding (almanac and
+three days of predicted orbits) plus this hour's precise broadcast ephemeris
+and ionosphere model from RINEX, in one UBX-MGA stream. Ephemeris covers GPS,
+Galileo and BeiDou. GLONASS and QZSS are left out: the receiver does not track
+them.</p>
+<p>The file carries no UBX-MGA-INI-TIME: the receiver supplies its own time when
+it applies the data, so a file downloaded hours after it was built is never
+wrong about the hour.</p>
 <h2>Test variants</h2>
-<p>One file per hypothesis, all built from the same data, for
-bisecting a receiver that will not fix. Each rung adds one thing to
-the one above it.</p>
+<p>One file per hypothesis, all built from the same data, for bisecting a
+receiver that will not fix. Each rung adds one thing to the one above it.</p>
 <ul>
   <li><a href="test/01-eph-gps.ubx">01-eph-gps</a> — GPS ephemeris, nothing else</li>
   <li><a href="test/02-eph-all.ubx">02-eph-all</a> — plus Galileo and BeiDou ephemeris</li>
