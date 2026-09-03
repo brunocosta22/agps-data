@@ -47,11 +47,15 @@ carry the file alone.
 
 `trigger-refresh.sh` fixes it from outside. Run it hourly from any machine that
 keeps time, with a token scoped to *Actions: write* on this repository and
-nothing else:
+nothing else. It uses only the Python standard library -- python3 is already
+needed to build the file, and curl is not always installed:
 
 ```sh
-5 * * * * GH_TOKEN=$(cat /etc/agps-gh-token) /opt/agps/trigger-refresh.sh >> /var/log/agps-trigger.log 2>&1
+5 * * * * GH_TOKEN_FILE=$HOME/.config/agps/gh-token $HOME/agps/trigger-refresh.sh >> $HOME/.local/state/agps-trigger.log 2>&1
 ```
+
+Pointing it at a file rather than passing `GH_TOKEN=` keeps the token out of the
+process listing.
 
 The workflow keeps its cron as a fallback; a dispatch and a schedule do the same
 work. To cut GitHub out of the timing altogether, run `refresh.sh` on that same
