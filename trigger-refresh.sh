@@ -45,8 +45,17 @@ def read_token() -> str:
         return token
     path = os.environ.get("GH_TOKEN_FILE", "")
     if path:
-        with open(os.path.expanduser(path)) as f:
-            return f.read().strip()
+        # Say what is wrong in one line rather than raising: this runs from cron
+        # every hour, and a missing or unreadable token file would otherwise put
+        # a traceback in the log each time.
+        try:
+            with open(os.path.expanduser(path)) as f:
+                token = f.read().strip()
+        except OSError as exc:
+            raise SystemExit(f"cannot read the token from {path}: {exc.strerror}")
+        if not token:
+            raise SystemExit(f"the token file {path} is empty")
+        return token
     raise SystemExit("set GH_TOKEN, or GH_TOKEN_FILE to a file holding it "
                      f"(needs Actions: write on {REPO})")
 
