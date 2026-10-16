@@ -32,7 +32,13 @@ import os
 import sys
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
+# Warn this many days before the token expires. A fine-grained token defaults to
+# 30 days, and when the first one lapsed the only symptom was an hourly "Bad
+# credentials" in a log nobody was reading -- the refresh quietly fell back to
+# GitHub's own scheduling for 14 days before anyone noticed.
+EXPIRY_WARNING_DAYS = 10
 
 REPO = os.environ.get("REPO", "brunocosta22/agps-data")
 WORKFLOW = os.environ.get("WORKFLOW", "agps.yml")
@@ -75,12 +81,16 @@ def main() -> int:
     )
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
-            code = r.status
+            code, headers = r.status, r.headers
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode(errors="replace")[:300]
-        # 401 the token is wrong, 403 it lacks Actions: write, 404 the workflow
-        # name does not match -- the body says which.
-        print(f"{stamp} dispatch failed: HTTP {exc.code} {body}", file=sys.stderr)
+        # Keep it to one line: this runs hourly, and the first token to lapse
+        # put a four-line JSON body in the log 24 times a day for two weeks.
+        detail = {
+            401: "the token is invalid or has expired",
+            403: f"the token lacks Actions: write on {REPO}",
+            404: f"no workflow named {WORKFLOW}, or no access to {REPO}",
+        }.get(exc.code, exc.read().decode(errors="replace")[:120].replace("\n", " "))
+        print(f"{stamp} dispatch failed: HTTP {exc.code} -- {detail}", file=sys.stderr)
         return 1
     except urllib.error.URLError as exc:
         print(f"{stamp} dispatch failed: {exc.reason}", file=sys.stderr)
@@ -88,7 +98,34 @@ def main() -> int:
 
     # A successful dispatch is 204 No Content.
     print(f"{stamp} dispatched {WORKFLOW} on {REF} (HTTP {code})")
+    warn_if_expiring(headers)
     return 0
+
+
+def warn_if_expiring(headers) -> None:
+    """Say so while there is still time to act.
+
+    GitHub returns the expiry of a fine-grained token in a response header, so
+    the warning costs no extra request. Absent header, or one in a shape not
+    recognised, means nothing is said -- a classic PAT has no expiry to report.
+    """
+    raw = (headers.get("github-authentication-token-expiration") or "").strip()
+    if not raw:
+        return
+    for fmt in ("%Y-%m-%d %H:%M:%S %Z", "%Y-%m-%d %H:%M:%S UTC", "%Y-%m-%dT%H:%M:%SZ"):
+        try:
+            expires = datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
+            break
+        except ValueError:
+            continue
+    else:
+        return
+    left = expires - datetime.now(timezone.utc)
+    if left <= timedelta(days=EXPIRY_WARNING_DAYS):
+        print(f"WARNING: the token expires in {left.days} day(s), on "
+              f"{expires.date()} -- renew it or the refresh silently falls back "
+              f"to GitHub's own scheduling, which is every 4 to 7 hours",
+              file=sys.stderr)
 
 
 if __name__ == "__main__":
