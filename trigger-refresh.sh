@@ -30,6 +30,7 @@ already required to build the file and curl is not always installed.
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -39,6 +40,15 @@ from datetime import datetime, timedelta, timezone
 # credentials" in a log nobody was reading -- the refresh quietly fell back to
 # GitHub's own scheduling for 14 days before anyone noticed.
 EXPIRY_WARNING_DAYS = 10
+
+# Retry a transient failure rather than losing the hour. Over seven days of
+# hourly runs the only three misses were one DNS lookup that fired two minutes
+# after the machine booted, before the resolver was up, and two 502s from
+# GitHub -- all of them gone by the next attempt, none of them helped by waiting
+# a full hour for the next cron tick. A wrong token or a missing permission is
+# not transient and is not retried.
+RETRY_DELAYS_S = (20, 60)
+RETRYABLE_STATUS = (500, 502, 503, 504, 429)
 
 REPO = os.environ.get("REPO", "brunocosta22/agps-data")
 WORKFLOW = os.environ.get("WORKFLOW", "agps.yml")
@@ -79,27 +89,42 @@ def main() -> int:
         },
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            code, headers = r.status, r.headers
-    except urllib.error.HTTPError as exc:
-        # Keep it to one line: this runs hourly, and the first token to lapse
-        # put a four-line JSON body in the log 24 times a day for two weeks.
-        detail = {
-            401: "the token is invalid or has expired",
-            403: f"the token lacks Actions: write on {REPO}",
-            404: f"no workflow named {WORKFLOW}, or no access to {REPO}",
-        }.get(exc.code, exc.read().decode(errors="replace")[:120].replace("\n", " "))
-        print(f"{stamp} dispatch failed: HTTP {exc.code} -- {detail}", file=sys.stderr)
-        return 1
-    except urllib.error.URLError as exc:
-        print(f"{stamp} dispatch failed: {exc.reason}", file=sys.stderr)
-        return 1
+    for attempt, delay in enumerate((0,) + RETRY_DELAYS_S):
+        if delay:
+            time.sleep(delay)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                code, headers = r.status, r.headers
+        except urllib.error.HTTPError as exc:
+            # Keep it to one line: this runs hourly, and the first token to
+            # lapse put a four-line JSON body in the log 24 times a day for two
+            # weeks.
+            detail = {
+                401: "the token is invalid or has expired",
+                403: f"the token lacks Actions: write on {REPO}",
+                404: f"no workflow named {WORKFLOW}, or no access to {REPO}",
+            }.get(exc.code, exc.read().decode(errors="replace")[:120].replace("\n", " "))
+            problem, retryable = f"HTTP {exc.code} -- {detail}", exc.code in RETRYABLE_STATUS
+        except urllib.error.URLError as exc:
+            # Includes the resolver not being up yet, which is what a cron tick
+            # a couple of minutes after boot runs into.
+            problem, retryable = str(exc.reason), True
+        else:
+            # A successful dispatch is 204 No Content.
+            if attempt:
+                print(f"{stamp} dispatched {WORKFLOW} on {REF} (HTTP {code}) "
+                      f"after {attempt} retry(s)")
+            else:
+                print(f"{stamp} dispatched {WORKFLOW} on {REF} (HTTP {code})")
+            warn_if_expiring(headers)
+            return 0
 
-    # A successful dispatch is 204 No Content.
-    print(f"{stamp} dispatched {WORKFLOW} on {REF} (HTTP {code})")
-    warn_if_expiring(headers)
-    return 0
+        if not retryable or attempt == len(RETRY_DELAYS_S):
+            print(f"{stamp} dispatch failed: {problem}", file=sys.stderr)
+            return 1
+        print(f"{stamp} dispatch failed: {problem} -- retrying in "
+              f"{RETRY_DELAYS_S[attempt]}s", file=sys.stderr)
+    return 1
 
 
 def warn_if_expiring(headers) -> None:
